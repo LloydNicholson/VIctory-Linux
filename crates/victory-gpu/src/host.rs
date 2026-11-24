@@ -2392,6 +2392,12 @@ struct Deferred {
     textures: std::collections::HashSet<usize>,
     /// Last GPU source copied into each aliased host texture in this list.
     texture_aliases: std::collections::HashMap<usize, usize>,
+    /// Title-written textures whose staging buffer is copied into the host
+    /// texture in this list's prelude if refreshed or not uploaded yet.
+    texture_uploads: Vec<(
+        std::sync::Arc<crate::resource::HostTexture>,
+        std::sync::Arc<crate::texture::Staging>,
+    )>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -5746,6 +5752,11 @@ impl Host {
         stage.next("submit: the lists' steps");
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+            // Textures this list's prelude may copy: their checks, batched
+            // over threads, are done before it looks at what they found.
+            if !list.deferred().texture_uploads.is_empty() {
+                batch.refresh_textures();
+            }
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -6680,11 +6691,34 @@ impl HostList {
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
-    /// from the other, if a list submitted earlier left it behind.
+    /// from the other, if a list submitted earlier left it behind. For
+    /// title-written textures whose staging buffer was refreshed (or has
+    /// not been uploaded yet) it copies the staging buffer into the host
+    /// texture before the list uses it.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        // `run_deferred` has already refreshed each staging buffer, so we
+        // know here exactly which textures need a GPU copy on this submission.
+        let uploads: Vec<_> = {
+            let deferred = self.deferred();
+            deferred
+                .texture_uploads
+                .iter()
+                .filter_map(|(copy, staging)| {
+                    if staging.take_upload() {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::TexUploads, 1);
+                        Some((copy.clone(), staging.clone()))
+                    } else {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+                        None
+                    }
+                })
+                .collect()
+        };
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -6736,13 +6770,35 @@ impl HostList {
                 }
             }
         }
+        for (copy, _) in &uploads {
+            let key = std::sync::Arc::as_ptr(copy) as usize;
+            if copying.contains_key(&key) {
+                continue;
+            }
+            let real = copy.state.load(Ordering::Relaxed);
+            copying.insert(key, COPY_DEST);
+            if real != COPY_DEST {
+                to_copy.push(transition(
+                    &copy.texture,
+                    host_state(real),
+                    host_state(COPY_DEST),
+                ));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(
+                        &copy.texture,
+                        host_state(COPY_DEST),
+                        host_state(real),
+                    ));
+                }
+            }
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6762,6 +6818,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (copy, staging) in &uploads {
+                    staging.record_copy(list, &copy.texture);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -6831,6 +6890,7 @@ impl HostList {
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
+                && deferred.texture_uploads.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
                 && deferred.texture_backs.is_empty())
@@ -7331,6 +7391,16 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    /// Copies `staging` into `copy` in this list's prelude when submitted,
+    /// if `staging` has not been uploaded yet or was detiled by `refresh`.
+    pub(crate) fn defer_texture_upload(
+        &self,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        staging: std::sync::Arc<crate::texture::Staging>,
+    ) {
+        self.deferred().texture_uploads.push((copy, staging));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
