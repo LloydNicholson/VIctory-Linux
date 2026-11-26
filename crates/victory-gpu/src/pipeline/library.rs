@@ -748,6 +748,12 @@ fn slow_ones() -> std::sync::MutexGuard<'static, Option<std::collections::HashMa
     slow
 }
 
+/// How long making the title pipeline with `key` took, in ms, if it took
+/// [`SLOW_MS`] or more in this or an earlier run.
+pub(super) fn slow_ms(key: &str) -> Option<u64> {
+    slow_ones().as_ref()?.get(key).copied()
+}
+
 /// Whether making the title pipeline with `key` took [`SLOW_MS`] in this or
 /// an earlier run.
 pub(crate) fn slow(key: &str) -> bool {

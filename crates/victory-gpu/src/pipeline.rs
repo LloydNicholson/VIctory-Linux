@@ -582,7 +582,10 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = make::shared(make::Pending::new(shaders.clone(), graphics));
+    // The first: the pipelines earlier runs drew with are made from here on.
+    #[cfg(windows)]
+    prepare::kick();
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
@@ -778,6 +781,15 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod prepare;
+
+/// The lines of the loading bar's box of the pipelines made at the start
+/// (`prepare`): none when nothing is being made.
+#[cfg(windows)]
+pub(crate) fn loading_lines() -> Vec<String> {
+    prepare::lines()
+}
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
