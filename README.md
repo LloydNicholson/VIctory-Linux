@@ -10,7 +10,7 @@ with or endorsed by the game's developer or publisher.
 
 ## Where it stands (2026-11-26)
 
-Tested on one PC:
+Tested on one PC, with `main` (VIctory-7900XTX's `main` as of 0ce46d5, its 33 merged PRs, and this fork's Linux work):
 
 | | |
 |---|---|
@@ -27,6 +27,7 @@ Tested on one PC:
 | Menus and title screens | 30 fps, while a "PREPARING SHADERS nn%" bar makes the pipelines earlier runs used |
 | Prologue, prison scene | 86-91 ms a frame (about 11 fps), ~4,700 draws (timed with card steps on) |
 | Crowded prison room | ~120 ms (8 fps), ~10,600 draws |
+| Boat checkpoint ("Just Like Paradise") | 101-116 ms (about 9 fps), ~3,900 draws; the card is busy about 40% of a frame, the rest is the CPU side |
 | Opening cutscenes | 100-180 ms |
 | Memory | **32 GB is enough to play**: across six measured runs, with desktop apps open, at least 5.3 GB stayed free and swap grew by about 3 GB (6 GB on a first run with cold caches). |
 
@@ -41,6 +42,8 @@ What is known to be wrong on Linux:
 - Glowing eyes in some close-ups; textures that appear late while the title streams.
 - A first start after a build, driver or Proton change has nothing recorded to prepare yet and stutters in places;
   later starts prepare it behind the bar.
+- Once, a start stopped about 7 s in on a breakpoint in the title's own code, before the title screens; starting
+  again went through.
 
 ## How to run it
 
@@ -54,6 +57,10 @@ cd VIctory-Linux
 source scripts/linux/env.sh
 cargo build --locked --profile diag -p victory --features diagnostics
 ```
+
+If cargo says it `can't find crate for core` for `x86_64-pc-windows-msvc`, the Rust it found has no Windows
+standard library: `rustup target add x86_64-pc-windows-msvc`, or keep a separate rustup for this and set
+`VICTORY_RUST_HOME=<dir>` (holding `rustup/` and `cargo/`) before sourcing `env.sh`.
 
 Then, **in a new shell without `env.sh`**, the page-mapping helper, and the compiler DLL next to the exe:
 
@@ -83,7 +90,7 @@ launcher made from `scripts/linux/victory.desktop.example.txt`. The details, and
 - **A Linux launcher** (`scripts/linux/`): build checks, a lock against overlapping runs, logs, and screenshots while
   you play, for finding faults.
 
-Branches: `main` has all of it, and is where work lands. `pr/*` hold the Linux fixes one by one on VIctory-7900XTX's `main`, ready to offer
+Branches: `main` has all of it and follows VIctory-7900XTX's `main`; work happens on `dev` and lands on `main`. `pr/*` hold the Linux fixes one by one on VIctory-7900XTX's `main`, ready to offer
 upstream. VIctory-7900XTX's own README, about its Windows build and what it changed:
 [docs/README-7900XTX.md](docs/README-7900XTX.md); its findings: [docs/findings.md](docs/findings.md); upstream's
 commands and switches: [docs/README-fxceless.md](docs/README-fxceless.md).
