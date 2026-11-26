@@ -132,6 +132,17 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
+        // Switches added since, only when set: other runs keep their keys (an unset name in the
+        // list above still changed every key: runs popimgcoh2 and cfcontrol started with 279 of
+        // 3,861 shaders cached, a black picture at 1-3 fps).
+        for name in ["VICTORY_CACHE_FENCES", "VICTORY_IMAGE_COHERENT"] {
+            if let Some(value) = std::env::var_os(name) {
+                bytes.extend_from_slice(name.as_bytes());
+                bytes.push(b'=');
+                bytes.extend_from_slice(value.as_encoded_bytes());
+                bytes.push(0);
+            }
+        }
         // A host wave width taken from `VICTORY_HOST_WAVE` (only when set, so other runs keep their keys).
         if let Some(value) = std::env::var_os("VICTORY_HOST_WAVE") {
             bytes.extend_from_slice(b"VICTORY_HOST_WAVE=");

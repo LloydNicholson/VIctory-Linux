@@ -11519,7 +11519,15 @@ impl<'a> Lower<'a> {
             self.s.flags |= flags::ROVS;
         }
         let rov = if ordered { 0x2000 } else { 0 };
-        let props = (kind | if uav { 0x1000 } else { 0 } | rov, 0x409);
+        // A load past the cache (GLC) of an unordered view: what other groups
+        // wrote is read, not what the host's caches kept ([`super::image_coherent`]).
+        let past_cache = uav
+            && !store
+            && !name.starts_with("image_atomic_")
+            && super::image_coherent()
+            && matches!(&inst.fields, Fields::Image { cache, .. } if cache.glc);
+        let coherent = if past_cache { 0x4000 } else { 0 };
+        let props = (kind | if uav { 0x1000 } else { 0 } | rov | coherent, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
             // GLC returns the old value. DXIL implements subtraction by adding
             // the two's complement of the operand at the same width.
@@ -12307,7 +12315,13 @@ impl<'a> Lower<'a> {
         };
         let name = inst.name();
         if name == "buffer_gl0_inv" || name == "buffer_gl1_inv" {
-            // The host has no console buffer cache to invalidate.
+            // The host has no console buffer cache to invalidate; but the
+            // program reads next what other groups wrote, and the host's own
+            // caches may still hold the bytes from before
+            // ([`super::cache_fences`]).
+            if super::cache_fences() && self.s.threads.is_some() {
+                self.memory_fence();
+            }
             return Ok(());
         }
         if *lds || *tfe {
