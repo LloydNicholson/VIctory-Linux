@@ -567,6 +567,9 @@ impl Shader {
                 }
             }
         }
+        // One back edge per loop, as DXC's loops have (after the clean-up,
+        // which could otherwise fold a latch away again).
+        self.m.single_latches();
         // Unordered views outside pixel and compute programs (memory by
         // address), as DXC counts them: ranges declared below, not views
         // picked from the heap (VIctory a1a2077a).
