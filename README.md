@@ -9,6 +9,53 @@ one PC, without giving up the picture. It is not there yet.
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
+## This fork: VIctory-Linux (current build, 2026-11-26)
+
+VIctory-7900XTX run on **Linux under Proton** (vkd3d-proton on RADV), with the fixes that needs. Branch `linux/xtx`;
+how to build and play: [scripts/linux/README.md](scripts/linux/README.md).
+
+**The PC it is tested on**
+
+| | |
+|---|---|
+| CPU | AMD Ryzen 7 5700X (8 cores, 16 threads) |
+| RAM | **32 GB** |
+| GPU | AMD Radeon RX 9060 XT, 16 GB (RDNA 4) |
+| OS | Nobara Linux 44 (Fedora), kernel 7.3, KDE Plasma 6.7 on Wayland, 1920x1080 |
+| Driver | Mesa 26.2.6 (RADV) |
+| Proton | Proton-CachyOS 11.0 (20261015), vkd3d-proton 1.1-5656 |
+
+**How it runs**
+
+| | |
+|---|---|
+| Menus and title screens | 30 fps, while the loading bar prepares shaders |
+| Prologue, prison scene | 86-91 ms a frame (about 11 fps), ~4,700 draws (measured with card steps on; `0` not yet timed) |
+| Crowded prison room | ~120 ms (8 fps), ~10,600 draws |
+| Opening cutscenes | 100-180 ms |
+| Memory on 32 GB | playable: across six measured runs, with desktop apps open, at least 5.3 GB stayed free and swap grew by about 3 GB (6 GB on a first run with cold caches). |
+
+**What this build adds to VIctory-7900XTX** (all on `linux/xtx`)
+
+- Title pages mapped without the wineserver (`victory_pages.so`): the biggest Linux cost, ~4.7 s to ~0.2 s a frame.
+- Radeon/vkd3d-proton fixes: no reads at address 0, an empty pipeline library made with a null blob, pipelines whose
+  compile never returns not waited for (64 MB worker stacks), one back edge per loop for dxil-spirv, waits that notice a
+  lost device.
+- A pipeline built for the render target format actually bound (heads were missing), texture views the card wrote
+  copied from the card (plastic-looking skin), boot images that changed after recording uploaded in the same submission.
+- Shaders made while the title boots, behind a "PREPARING SHADERS nn%" bar.
+- The frame recorder working under Proton.
+- The 16-bit face-network views (`VICTORY_HALF_VIEWS=1`, off: see below).
+
+**Known problems on Linux**
+
+- With `VICTORY_HALF_VIEWS=1` mouths move, but the two main characters' are distorted and out of time; other
+  characters' are right. Off by default: faces look natural and mouths stay still.
+- `VICTORY_CARD_STEPS=2` (play.ps1's value) breaks skinned meshes here: use `0`.
+- Glowing eyes in some close-ups.
+
+The rest of this README is VIctory-7900XTX's own.
+
 ## Where it stands (2026-11-25)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
