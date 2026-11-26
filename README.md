@@ -51,7 +51,6 @@ unpacked by [xwin](https://github.com/Jake-Shadle/xwin), Microsoft's `d3dcompile
 ```bash
 git clone https://github.com/LloydNicholson/VIctory-Linux
 cd VIctory-Linux
-git switch linux/xtx
 source scripts/linux/env.sh
 cargo build --locked --profile diag -p victory --features diagnostics
 ```
@@ -84,7 +83,7 @@ launcher made from `scripts/linux/victory.desktop.example.txt`. The details, and
 - **A Linux launcher** (`scripts/linux/`): build checks, a lock against overlapping runs, logs, and screenshots while
   you play, for finding faults.
 
-Branches: `linux/xtx` has all of it. `pr/*` hold the Linux fixes one by one on VIctory-7900XTX's `main`, ready to offer
+Branches: `main` has all of it, and is where work lands. `pr/*` hold the Linux fixes one by one on VIctory-7900XTX's `main`, ready to offer
 upstream. VIctory-7900XTX's own README, about its Windows build and what it changed:
 [docs/README-7900XTX.md](docs/README-7900XTX.md); its findings: [docs/findings.md](docs/findings.md); upstream's
 commands and switches: [docs/README-fxceless.md](docs/README-fxceless.md).
