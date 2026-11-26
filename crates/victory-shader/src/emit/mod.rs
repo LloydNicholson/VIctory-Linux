@@ -184,6 +184,23 @@ pub fn group_sync() -> u8 {
     })
 }
 
+/// Whether 16-bit halves moved through views of tables keep their bits
+/// (`VICTORY_HALF_VIEWS=1`; off by default). The face network
+/// (`compute_graph_ops`, then `ped_standard_head_cs`) keeps its halves in
+/// 16-bit unsigned views; read as floats there every value was 0 and no
+/// mouth moved. With this on under vkd3d-proton on RADV the mouths move,
+/// but the main characters' faces come out torn and shiny (the network
+/// still computes wrong values there; cause not found), so the still faces
+/// stay the default. Part of the translation: the shader cache keys on it.
+pub fn half_views_on() -> bool {
+    // (The tests check the translation with it.)
+    if cfg!(test) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_VIEWS").is_some_and(|v| v == "1"))
+}
+
 /// Whether buffer atomics of the ray-tracing structure builder stand between
 /// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
 /// translation: the shader cache keys on it.

@@ -2415,7 +2415,8 @@ impl<'a> Lower<'a> {
             self.s.entry = body;
         }
         self.find_coherent();
-        self.halves_only = self.places_read_as_halves();
+        // (Nothing moves halves as integers unless `VICTORY_HALF_VIEWS=1`.)
+        self.halves_only = if super::half_views_on() { self.places_read_as_halves() } else { Default::default() };
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
