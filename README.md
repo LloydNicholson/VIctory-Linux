@@ -74,6 +74,12 @@ Make the Proton prefix once with `scripts/linux/victory.sh init`, copy `scripts/
 launcher made from `scripts/linux/victory.desktop.example.txt`. The details, and what each piece is for:
 [scripts/linux/README.md](scripts/linux/README.md).
 
+**Wait for the shader bar before you start.** On the first screens a "PREPARING SHADERS nn%" bar makes the shaders
+earlier runs needed (about two minutes from a cold cache on the PC above). Stay on the title screens until it is gone,
+then press Enter: what it has not finished, the game makes as it draws, and the opening cutscene stutters. The very
+first start (or the first after a build, Mesa or Proton change) has nothing recorded yet, so it stutters regardless;
+the next start prepares what that one used.
+
 ## What this fork adds to VIctory-7900XTX
 
 - **Title pages mapped without the wineserver** (`victory_pages.so`, a Wine unix library that moves a section's pages
