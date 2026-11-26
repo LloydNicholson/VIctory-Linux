@@ -33,14 +33,14 @@ Tested on one PC, with `main` (VIctory-7900XTX's `main` as of 0ce46d5, its 33 me
 
 What is known to be wrong on Linux:
 
-- **Mouths need a patched RADV.** On the stock driver, `VICTORY_HALF_VIEWS=1` makes mouths move but the main
-  characters' come out distorted and some faces shiny. The cause is in RADV: a compute shader whose threads exchange
-  data through a storage buffer across a workgroup barrier can read stale values when RADV runs the workgroup across
-  both compute units of a WGP (each has its own vector cache, and nothing invalidates it at the barrier). With
-  `scripts/linux/build-radv.sh` (Mesa 26.2.6 plus `scripts/linux/mesa/radv-cu-mode.patch.txt`, built beside the system
-  driver, used by the launcher alone) and `RADV_VICTORY_CU_MODE=1`, such shaders stay on one compute unit and faces and
-  mouths come out right, at no measurable cost. Without it, leave `VICTORY_HALF_VIEWS` off: faces look natural but
-  mouths do not move.
+- **Mouths need a workaround in RADV for now.** On the stock driver, `VICTORY_HALF_VIEWS=1` makes mouths move but the
+  main characters' come out distorted and some faces shiny. The face network's first pass is a console shader whose
+  lanes rely on the console's in-wave order across a group barrier; the translation does not keep that order, so the
+  result depends on how the card schedules the workgroup (AMDVLK happens to match the console, RADV does not). RADV's
+  barriers themselves are correct. Until the translation keeps the order, `scripts/linux/build-radv.sh` builds a RADV
+  with `RADV_VICTORY_CU_MODE` (`scripts/linux/mesa/radv-cu-mode.patch.txt`, used by the launcher alone): with it such
+  shaders run with the whole workgroup on one compute unit, and faces and mouths come out right at no measurable cost.
+  Without it, leave `VICTORY_HALF_VIEWS` off: faces look natural but mouths do not move.
 - `VICTORY_CARD_STEPS=2` (play.ps1's value) hands back wrong skinned meshes (stretched slabs over people, faces lost):
   use `0`, as the Linux launcher does.
 - Glowing eyes in some close-ups; textures that appear late while the title streams.

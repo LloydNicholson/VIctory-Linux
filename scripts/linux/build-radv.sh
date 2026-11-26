@@ -1,5 +1,6 @@
 #!/bin/bash
-# build-radv.sh [mesa tag]: builds Mesa's RADV (the AMD Vulkan driver) with mesa/radv-cu-mode.patch.txt into
+# build-radv.sh [mesa tag]: builds Mesa's RADV (the AMD Vulkan driver) with mesa/radv-cu-mode.patch.txt (a workaround
+# for the face shaders' ordering, see README.md) into
 # VICTORY_STATE/mesa-local (default ~/.local/share/victory-proton/mesa-local), for the launcher alone: set DRIVER_JSON in
 # play.conf to the path this prints. The system's driver is not touched. Needs git, a C/C++ compiler, ninja, python3
 # (meson, mako and pyyaml go into a venv here), and the usual RADV build dependencies (libdrm, libelf, zstd, wayland,

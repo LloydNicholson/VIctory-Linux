@@ -1,18 +1,19 @@
-radv: keep compute that syncs storage memory at a workgroup barrier in CU mode (RADV_VICTORY_CU_MODE)
+radv: RADV_VICTORY_CU_MODE, a workaround that runs compute which syncs storage memory at a workgroup barrier in CU mode
 
-For Mesa 26.2.6 (applies with git apply / patch -p1 at the top of a Mesa checkout). See scripts/linux/README.md.
+For Mesa 26.2.6 (git apply / patch -p1 at the top of a Mesa checkout). Not a RADV bug fix: see scripts/linux/README.md.
 
 diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
-index 312b7c0..76d4100 100644
+index 312b7c0..661d10d 100644
 --- a/src/amd/vulkan/radv_shader.c
 +++ b/src/amd/vulkan/radv_shader.c
-@@ -1605,6 +1605,17 @@ radv_should_use_wgp_mode(enum amd_gfx_level gfx_level, mesa_shader_stage stage,
+@@ -1605,6 +1605,18 @@ radv_should_use_wgp_mode(enum amd_gfx_level gfx_level, mesa_shader_stage stage,
     if (stage == MESA_SHADER_FRAGMENT)
        return false;
  
-+   /* Victory (local patch): compute in CU mode, where a workgroup's waves share one CU's vector L0. In WGP mode
-+    * they may run on both CUs of a WGP, each with its own L0, and ACO emits no L0 invalidation at a
-+    * workgroup-scope acquire, so a wave may read another wave's store stale after the barrier.
++   /* Victory (local workaround, not a RADV fix): compute in CU mode, a workgroup's waves on one CU. A translated
++    * console shader whose lanes depend on the console's in-wave order across a group barrier (a race in the
++    * translation) then runs in the order the console and AMDVLK give; in WGP mode it does not. RADV's barriers are
++    * correct (standalone tests with storage and texel buffers find no stale reads either way).
 +    * RADV_VICTORY_CU_MODE=1: shaders with a workgroup-scope acquire over storage memory; =2: every compute shader. */
 +   if (stage == MESA_SHADER_COMPUTE) {
 +      const char *cu = os_get_option("RADV_VICTORY_CU_MODE");
@@ -42,14 +43,14 @@ index d4d4fba..7ead5c4 100644
     case nir_intrinsic_load_barycentric_pixel:
     case nir_intrinsic_load_barycentric_centroid:
 diff --git a/src/amd/vulkan/radv_shader_info.h b/src/amd/vulkan/radv_shader_info.h
-index 8b4973a..2cb2c0b 100644
+index 8b4973a..4f23522 100644
 --- a/src/amd/vulkan/radv_shader_info.h
 +++ b/src/amd/vulkan/radv_shader_info.h
 @@ -230,6 +230,7 @@ struct radv_shader_info {
  
        bool uses_full_subgroups : 1;
        bool linear_taskmesh_dispatch : 1;
-+      bool syncs_storage_in_workgroup : 1; /* Victory: a workgroup-scope barrier over SSBO/image/global memory */
++      bool syncs_storage_in_workgroup : 1; /* Victory workaround: a workgroup-scope acquire over SSBO/image/global memory */
        bool has_query : 1; /* Task shader only */
  
        uint32_t derivative_group : 2;
