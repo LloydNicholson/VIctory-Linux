@@ -82,6 +82,9 @@ the next start prepares what that one used.
 
 ## What this fork adds to VIctory-7900XTX
 
+- **Memory holes known without asking Wine** (`VICTORY_TOLD_HOLES=1`, in the Linux launcher's switches): Wine cannot
+  answer the question that tells a placeholder's holes, so each was asked about again every frame, ~20,000 times; the
+  runtime now says where its placeholders are. 115 -> 108 ms a frame on the boat checkpoint.
 - **Title pages mapped without the wineserver** (`victory_pages.so`, a Wine unix library that moves a section's pages
   into place with `mremap`): the wineserver walks every view on every map, which cost about 4.7 s a frame; ~0.2 s after.
 - **Radeon and vkd3d-proton fixes**: no reads at address 0 from heap-picked loads or empty root views, an empty
