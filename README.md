@@ -27,7 +27,7 @@ Tested on one PC, with `main` (VIctory-7900XTX's `main` as of 0ce46d5, its 33 me
 | Menus and title screens | 30 fps, while a "PREPARING SHADERS nn%" bar makes the pipelines earlier runs used |
 | Prologue, prison scene | 86-91 ms a frame (about 11 fps), ~4,700 draws (timed with card steps on) |
 | Crowded prison room | ~120 ms (8 fps), ~10,600 draws |
-| Boat checkpoint ("Just Like Paradise") | 101-116 ms (about 9 fps), ~3,900 draws; the card is busy about 40% of a frame, the rest is the CPU side |
+| Boat checkpoint ("Just Like Paradise") | 101-116 ms with the stock settings; **about 70 ms (14 fps)** with card steps, renderer ports 2, 5 and 6 and a 1080p output (`scripts/linux/play.conf.example.sh` says how) |
 | Opening cutscenes | 100-180 ms |
 | Memory | **32 GB is enough to play**: across six measured runs, with desktop apps open, at least 5.3 GB stayed free and swap grew by about 3 GB (6 GB on a first run with cold caches). |
 
