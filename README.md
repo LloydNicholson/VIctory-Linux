@@ -1,20 +1,16 @@
-# VIctory on an RX 7900 XTX
+# VIctory-Linux
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+A fork of [VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX), itself a fork of
+[VIctory](https://github.com/Marvisak/VIctory), a compatibility layer that runs an Xbox Series title from files the
+user supplies. This one is about **running it on Linux**: the Windows build of `victory.exe` under Proton, with
+vkd3d-proton on Mesa's RADV driver, on an AMD Radeon card. It is playable, not finished.
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+**This repository contains no game files, code or assets.** You need your own copy of the game. It is not affiliated
+with or endorsed by the game's developer or publisher.
 
-## This fork: VIctory-Linux (current build, 2026-11-26)
+## Where it stands (2026-11-26)
 
-VIctory-7900XTX run on **Linux under Proton** (vkd3d-proton on RADV), with the fixes that needs. Branch `linux/xtx`;
-how to build and play: [scripts/linux/README.md](scripts/linux/README.md).
-
-**The PC it is tested on**
+Tested on one PC:
 
 | | |
 |---|---|
@@ -24,152 +20,94 @@ how to build and play: [scripts/linux/README.md](scripts/linux/README.md).
 | OS | Nobara Linux 44 (Fedora), kernel 7.3, KDE Plasma 6.7 on Wayland, 1920x1080 |
 | Driver | Mesa 26.2.6 (RADV) |
 | Proton | Proton-CachyOS 11.0 (20261015), vkd3d-proton 1.1-5656 |
-
-**How it runs**
+| Profile | Series X |
 
 | | |
 |---|---|
-| Menus and title screens | 30 fps, while the loading bar prepares shaders |
-| Prologue, prison scene | 86-91 ms a frame (about 11 fps), ~4,700 draws (measured with card steps on; `0` not yet timed) |
+| Menus and title screens | 30 fps, while a "PREPARING SHADERS nn%" bar makes the pipelines earlier runs used |
+| Prologue, prison scene | 86-91 ms a frame (about 11 fps), ~4,700 draws (timed with card steps on) |
 | Crowded prison room | ~120 ms (8 fps), ~10,600 draws |
 | Opening cutscenes | 100-180 ms |
-| Memory on 32 GB | playable: across six measured runs, with desktop apps open, at least 5.3 GB stayed free and swap grew by about 3 GB (6 GB on a first run with cold caches). |
+| Memory | **32 GB is enough to play**: across six measured runs, with desktop apps open, at least 5.3 GB stayed free and swap grew by about 3 GB (6 GB on a first run with cold caches). |
 
-**What this build adds to VIctory-7900XTX** (all on `linux/xtx`)
+What is known to be wrong on Linux:
 
-- Title pages mapped without the wineserver (`victory_pages.so`): the biggest Linux cost, ~4.7 s to ~0.2 s a frame.
-- Radeon/vkd3d-proton fixes: no reads at address 0, an empty pipeline library made with a null blob, pipelines whose
-  compile never returns not waited for (64 MB worker stacks), one back edge per loop for dxil-spirv, waits that notice a
-  lost device.
-- A pipeline built for the render target format actually bound (heads were missing), texture views the card wrote
-  copied from the card (plastic-looking skin), boot images that changed after recording uploaded in the same submission.
-- Shaders made while the title boots, behind a "PREPARING SHADERS nn%" bar.
-- The frame recorder working under Proton.
-- The 16-bit face-network views (`VICTORY_HALF_VIEWS=1`, off: see below).
-
-**Known problems on Linux**
-
-- With `VICTORY_HALF_VIEWS=1` mouths move, but the two main characters' are distorted and out of time; other
-  characters' are right. Off by default: faces look natural and mouths stay still.
-- `VICTORY_CARD_STEPS=2` (play.ps1's value) breaks skinned meshes here: use `0`.
-- Glowing eyes in some close-ups.
-
-The rest of this README is VIctory-7900XTX's own.
-
-## Where it stands (2026-11-25)
-
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, 1440p, the Series X profile.
-
-| | |
-|---|---|
-| Menus, videos, loading screens | 30 fps |
-| Prologue, indoors | 50-75 ms a frame (13-20 fps) |
-| First mission with the boat | 46-53 ms (19-22 fps) |
-| Street chase with many cars and people | 100-165 ms (6-10 fps), single frames far longer |
-| Outdoors on foot, the camp | 60-90 ms |
-| Flying | 42-57 ms |
-| Longest session so far | 41 minutes, no crash |
-| Memory | 40-46 GB of private memory: **64 GB of RAM recommended** |
-
-It started at 280 ms a frame in the same scenes two days earlier.
-
-What is known to be wrong:
-
-- Trees, plants and far buildings flicker outdoors in some places.
-- Rooms with little direct light are too dark without `-RayTracing`.
-- Textures of what just came into view appear late while the title streams.
-- The first run with a new driver or a new build stutters while the driver makes
-  pipelines (`victory warm` makes them ahead).
-- Recording a frame in the world makes the title's own watchdog end it.
+- **Mouths.** By default faces look natural but mouths do not move. With `VICTORY_HALF_VIEWS=1` they move, but the two
+  main characters' mouths are distorted and out of time (other characters' are right). The same build on AMD's own
+  Vulkan driver (AMDVLK) draws them right, and Mesa 27.0-devel still distorts them, so it points at RADV. Being
+  narrowed down pass by pass.
+- `VICTORY_CARD_STEPS=2` (play.ps1's value) hands back wrong skinned meshes (stretched slabs over people, faces lost):
+  use `0`, as the Linux launcher does.
+- Glowing eyes in some close-ups; textures that appear late while the title streams.
+- A first start after a build, driver or Proton change has nothing recorded to prepare yet and stutters in places;
+  later starts prepare it behind the bar.
 
 ## How to run it
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+You need Linux with Steam (for the Steam Linux Runtime and a Proton, e.g. Proton-CachyOS), Mesa's RADV, a CPU with
+AVX2, Rust (the toolchain is pinned), LLVM's `clang-cl`, `lld-link` and `llvm-lib`, the MSVC CRT and Windows SDK
+unpacked by [xwin](https://github.com/Jake-Shadle/xwin), Microsoft's `d3dcompiler_47.dll`, and your own dump of the title.
 
-```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
+```bash
+git clone https://github.com/LloydNicholson/VIctory-Linux
+cd VIctory-Linux
+git switch linux/xtx
+source scripts/linux/env.sh
 cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+Then, **in a new shell without `env.sh`**, the page-mapping helper, and the compiler DLL next to the exe:
 
-Before the first run, ahead of time (both can be stopped and go on later):
-
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+```bash
+sh crates/victory-hle/unix/build.sh target/x86_64-pc-windows-msvc/diag
+cp ~/.cache/winetricks/d3dcompiler_47/d3dcompiler_47.dll target/x86_64-pc-windows-msvc/diag/
 ```
 
-After a change of the translator or the driver, a run makes the pipelines
-earlier runs drew with while the title boots, from the pipelines kept of earlier
-runs (on by default; `VICTORY_PIPELINE_BOOK=0` keeps none): a small bar on the
-title's first screens ("preparing shaders" and a percentage) shows how far it
-is. Pressing A starts the game at once, but it runs slowly until the bar is
-full. What is made
-is kept on disk, and a start with nothing new shows no bar. `VICTORY_PREPARE=0`
-makes nothing at the start. Under Proton, set `VICTORY_HOST_STACK` to something
-that changes with Mesa and Proton (the launch script does), so that a driver
-update makes them again too.
+Make the Proton prefix once with `scripts/linux/victory.sh init`, copy `scripts/linux/play.conf.example.sh` to
+`~/.local/share/victory-proton/play.conf` and set your paths, and start with `scripts/linux/play.sh` or a desktop
+launcher made from `scripts/linux/victory.desktop.example.txt`. The details, and what each piece is for:
+[scripts/linux/README.md](scripts/linux/README.md).
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
+## What this fork adds to VIctory-7900XTX
 
-## What is different here
+- **Title pages mapped without the wineserver** (`victory_pages.so`, a Wine unix library that moves a section's pages
+  into place with `mremap`): the wineserver walks every view on every map, which cost about 4.7 s a frame; ~0.2 s after.
+- **Radeon and vkd3d-proton fixes**: no reads at address 0 from heap-picked loads or empty root views, an empty
+  pipeline library made with a null blob, pipelines whose compile never returns not waited for (64 MB worker stacks),
+  one back edge per loop (dxil-spirv recursed without end), waits that notice a lost device.
+- **Picture fixes from other forks**: a pipeline for the render target format actually bound (heads were missing),
+  texture views the card wrote copied from the card (plastic-looking skin), boot images that changed after recording
+  uploaded in the same submission.
+- **Shaders prepared while the title boots**, behind a "PREPARING SHADERS nn%" bar, keyed on the Mesa and Proton in use.
+- **The 16-bit face-network views** (`VICTORY_HALF_VIEWS=1`, off by default: see above).
+- **The frame recorder under Proton** (`VICTORY_RECORD`), and `VICTORY_HOST_WAVE=32` to compare a card's two wave forms.
+- **A Linux launcher** (`scripts/linux/`): build checks, a lock against overlapping runs, logs, and screenshots while
+  you play, for finding faults.
 
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+Branches: `linux/xtx` has all of it. `pr/*` hold the Linux fixes one by one on VIctory-7900XTX's `main`, ready to offer
+upstream. VIctory-7900XTX's own README, about its Windows build and what it changed:
+[docs/README-7900XTX.md](docs/README-7900XTX.md); its findings: [docs/findings.md](docs/findings.md); upstream's
+commands and switches: [docs/README-fxceless.md](docs/README-fxceless.md).
 
 ## Credits
 
-This is a tree of other people's work with more on top. The history is kept, and
-commits taken from elsewhere name the commit and its author.
+This is a tree of other people's work with more on top. The history is kept, and commits taken from elsewhere name
+the commit and its author.
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
-- **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its contributors: the loader, the runtime
+  services, the Direct3D 12 back end and the shader recompiler.
+- **[VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** by avatarmanz: the fast tree this one runs on,
+  and the reporters on its tracker whose Linux findings (issues #13, #59, #111) pointed the way.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**, **[DexNom/VIctory](https://github.com/DexNom/VIctory)**,
+  **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**,
+  **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**,
+  **[myokex/victory-amd](https://github.com/myokex/victory-amd)**, **Geckomacabre**, **cxy0072019-sketch** and
+  **tippythetaidum** (the d16 face fix), as credited in VIctory-7900XTX.
+- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same title behaves under another layer;
+  no code of it is here.
 - This fork's changes were made with [Claude Code](https://claude.com/claude-code).
 
 ## License
 
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
-
-ZETTROX
+GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not covered is named in
+[docs/asset-policy.md](docs/asset-policy.md).

@@ -42,13 +42,14 @@ behind a "PREPARING SHADERS nn%" bar on the first screens, so the opening cutsce
 - `VICTORY_CARD_STEPS=0`: with `2`, skinned meshes come back wrong (stretched slabs over people, faces lost); seen on
   Linux and on some Windows cards (7900XTX issue #13). Costs little.
 - `VICTORY_HALF_VIEWS=1` (mouths move) is off: on Linux the two main characters' mouths come out distorted and out of
-  time with it, while other characters' are right. Not yet explained (see below).
+  time with it, while other characters' are right. On AMDVLK they are right, on RADV (also Mesa 27.0-devel) not.
 
 ## Known on Linux
 
 - **Main characters' mouths** with `VICTORY_HALF_VIEWS=1` (or 7900XTX PR #114's version): distorted and mistimed.
   Ruled out so far: a bad checkpoint save, card steps, relay stage 2, landing echo and the other copy shortcuts (all
-  off together still distorts), the card's handling of 16-bit views (test `heap_half_tests`), 64-lane waves.
+  off together still distorts), the card's handling of 16-bit views (test `heap_half_tests`), the wave form
+  (`VICTORY_HOST_WAVE=32` distorts too). AMD's own driver (AMDVLK 2025.Q2.1) draws them right: it points at RADV.
 - `VICTORY_LAND_ECHO=0` moves face faults between characters rather than fixing them.
 - Recording a frame (`VICTORY_RECORD`) works under Proton (the recorder hands lists to vkd3d-proton with their own
   method tables) and needs ~6 GB of RAM more than playing.
