@@ -1640,13 +1640,13 @@ mod tests {
             user_data: 4,
             slot: 1,
         };
-        let made = state.tables(&list, &[range], &[], &[(1, 8)], true);
+        let made = state.tables(&list, &[range], &[], &[(1, 8)], true).to_vec();
         let [(1, offset)] = made[..] else {
             panic!("one fresh table for root parameter 1, not {made:?}");
         };
         assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
         let next = host_heap.dynamic(1).expect("a dynamic slot");
-        host_heap.release(next, 1, false);
+        host_heap.release(next, 1);
         drop(state);
         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
         assert_eq!(
