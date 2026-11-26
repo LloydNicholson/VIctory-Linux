@@ -1,7 +1,8 @@
-//! Every pipeline the title has ever created, kept on disk
-//! (`VICTORY_PIPELINE_BOOK=1`), and their host pipelines made ahead of a run
-//! (`victory warm`), so that the driver's own cache on disk has them before
-//! a draw asks for one.
+//! Every pipeline the title has ever created, kept on disk (on by default;
+//! `VICTORY_PIPELINE_BOOK=0` keeps none), and their host pipelines made
+//! ahead of a run (`victory warm`, or at the start of one: `super::prepare`),
+//! so that the driver's own cache on disk has them before a draw asks for
+//! one.
 //!
 //! The title creates 84,000 pipelines while it loads and draws with some
 //! 2,000 of them; which ones is known from earlier runs (`library`), and
@@ -37,10 +38,12 @@ const PIPELINES: &str = "known-pipelines.bin";
 const STAGES: [&str; 8] =
     ["vertex", "pixel", "domain", "hull", "geometry", "compute", "amplification", "mesh"];
 
-/// `VICTORY_PIPELINE_BOOK=1`: the pipelines the title creates are kept.
+/// Whether the pipelines the title creates are kept: on by default, as the
+/// pipelines made at the start of a run (`super::prepare`) are made from
+/// them; `VICTORY_PIPELINE_BOOK=0` keeps none.
 fn on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BOOK").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_BOOK").is_none_or(|v| v != "0"))
 }
 
 struct Book {
@@ -198,14 +201,54 @@ pub fn keys(dir: &Path) -> Vec<String> {
 }
 
 /// What a driver's cached pipelines depend on besides the title's: the
-/// translator with its settings, and the driver.
+/// translator with its settings, and the driver. Under Proton the driver's
+/// number DXGI gives does not change with Mesa or vkd3d-proton:
+/// `VICTORY_HOST_STACK`, set by the script that starts the run (the Vulkan
+/// driver's and Proton's versions), stands for them.
 pub fn fingerprint() -> String {
     let mut h = blake3::Hasher::new();
     h.update(&crate::shader_cache::translation());
     if let Some(host) = crate::host::host() {
         h.update(&host.driver().to_le_bytes());
     }
+    if let Some(stack) = std::env::var_os("VICTORY_HOST_STACK") {
+        h.update(stack.as_encoded_bytes());
+    }
     h.finalize().to_hex()[..16].to_owned()
+}
+
+/// A pipeline of the book: its key, shaders and graphics state.
+pub(super) type Entry = (String, Vec<Arc<Shader>>, Option<Box<GraphicsState>>);
+
+/// The pipelines of the book in `dir` whose keys `wanted` holds, in the
+/// book's order (those whose shaders are not in it are left out).
+pub(super) fn entries(dir: &Path, wanted: &HashSet<String>) -> Vec<Entry> {
+    let mut places = HashMap::new();
+    walk_shaders(dir, |_, hash, at, len| {
+        places.insert(hash, (at, len));
+    });
+    let Ok(mut file) = std::fs::File::open(dir.join(SHADERS)) else { return Vec::new() };
+    let mut picked = Vec::new();
+    walk_pipelines(dir, |_, bytes| {
+        let key: String = bytes.get(..16).unwrap_or_default().iter().map(|b| format!("{b:02x}")).collect();
+        if wanted.contains(&key) {
+            picked.push((key, bytes.to_vec()));
+        }
+    });
+    let mut read = |hash: &[u8; 32]| {
+        let &(at, len) = places.get(hash)?;
+        let mut bytes = vec![0; len as usize];
+        file.seek(SeekFrom::Start(at)).ok()?;
+        file.read_exact(&mut bytes).ok()?;
+        Some(bytes)
+    };
+    picked
+        .into_iter()
+        .filter_map(|(key, entry)| {
+            let (shaders, g) = parse(&entry, &mut read)?;
+            Some((key, shaders, g))
+        })
+        .collect()
 }
 
 /// The translations of earlier runs are in `dir` (the pipeline library is

@@ -310,6 +310,10 @@ pub(crate) struct State {
     /// it has any ([`State::set_targets`]): per view the host texture (0:
     /// a null view) and what its descriptor says.
     host_targets: Option<(Vec<TargetKey>, Option<TargetKey>)>,
+    /// The formats of the views [`State::set_targets`] bound on the host
+    /// list: a draw's pipeline is one for them
+    /// (`crate::pipeline::host_pipeline_for`).
+    target_formats: crate::pipeline::host::TargetFormats,
     viewports: Vec<D3D12_VIEWPORT>,
     scissors: Vec<RECT>,
     blend: Option<[f32; 4]>,
@@ -724,6 +728,137 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     list.fill_scratch(address as *const u8, len)
 }
 
+/// Bytes of the zero-filled buffer bound where a root constant buffer or
+/// shader resource view has nothing to point at ([`null_root_view`]): the
+/// largest constant buffer.
+const NULL_ROOT_BYTES: u64 = 64 << 10;
+
+/// The buffer behind [`null_root_view`].
+struct NullRoot {
+    /// Held so the buffer lives as long as the process.
+    #[cfg_attr(not(test), allow(dead_code))]
+    buffer: ID3D12Resource,
+    gpu: u64,
+}
+
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for NullRoot {}
+// SAFETY: as above.
+unsafe impl Sync for NullRoot {}
+
+fn make_null_root(device: &ID3D12Device) -> Option<NullRoot> {
+    let heap = D3D12_HEAP_PROPERTIES {
+        Type: D3D12_HEAP_TYPE_UPLOAD,
+        ..Default::default()
+    };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: NULL_ROOT_BYTES,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation of an upload buffer; its bytes are written
+    // through its own mapping before anything reads them.
+    unsafe {
+        device
+            .CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                &desc,
+                D3D12_RESOURCE_STATE_GENERIC_READ,
+                None,
+                &mut buffer,
+            )
+            .ok()?;
+        let buffer = buffer?;
+        let mut data = std::ptr::null_mut();
+        buffer.Map(0, None, Some(&mut data)).ok()?;
+        std::ptr::write_bytes(data.cast::<u8>(), 0, NULL_ROOT_BYTES as usize);
+        buffer.Unmap(0, None);
+        let gpu = buffer.GetGPUVirtualAddress();
+        Some(NullRoot { buffer, gpu })
+    }
+}
+
+/// A zero-filled buffer's address, for a root constant buffer or shader
+/// resource view that has nothing to point at (no host copy of the title's
+/// address, the title never set it, our directory not ready). Left unset,
+/// a root descriptor is undefined: the host's D3D12 on Linux passes it to
+/// the shader as a raw pointer, null or the previous draw's (possibly freed)
+/// buffer, and a read through it faults the card and loses the device (a
+/// scalar-cache read at 0xd000 in one run). Zeros are what such a read
+/// gives on the console's card for an unmapped page.
+fn null_root_view() -> Option<u64> {
+    static NULL: std::sync::OnceLock<Option<NullRoot>> = std::sync::OnceLock::new();
+    NULL.get_or_init(|| make_null_root(&crate::host::host()?.device))
+        .as_ref()
+        .map(|n| n.gpu)
+}
+
+/// Root views bound to [`null_root_view`] since the start.
+static NULL_ROOTS: AtomicU64 = AtomicU64::new(0);
+
+/// Counts a root view bound to [`null_root_view`], logged at the first
+/// and then at every power of two.
+fn note_null_root(reason: &'static str, slot: u8, address: Option<u64>) {
+    let n = NULL_ROOTS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_power_of_two() {
+        tracing::warn!(
+            reason,
+            slot,
+            address = ?address.map(|a| format!("{a:#x}")),
+            count = n,
+            "a root view with nothing to point at: a zero-filled buffer is bound instead"
+        );
+    }
+}
+
+/// Sets a root constant buffer (`srv` false) or shader resource view.
+/// # Safety
+/// `l` is open and `gpu` lies in a buffer the list keeps alive.
+unsafe fn set_root_view(
+    l: &ID3D12GraphicsCommandList,
+    compute: bool,
+    srv: bool,
+    param: u32,
+    gpu: u64,
+) {
+    // SAFETY: as the caller promises.
+    unsafe {
+        match (compute, srv) {
+            (false, false) => l.SetGraphicsRootConstantBufferView(param, gpu),
+            (false, true) => l.SetGraphicsRootShaderResourceView(param, gpu),
+            (true, false) => l.SetComputeRootConstantBufferView(param, gpu),
+            (true, true) => l.SetComputeRootShaderResourceView(param, gpu),
+        }
+    }
+}
+
+/// Binds [`null_root_view`] at `param` and counts why.
+fn bind_null_root(
+    l: &ID3D12GraphicsCommandList,
+    compute: bool,
+    srv: bool,
+    param: u32,
+    slot: u8,
+    address: Option<u64>,
+    reason: &'static str,
+) {
+    note_null_root(reason, slot, address);
+    if let Some(gpu) = null_root_view() {
+        // SAFETY: an open list; the null buffer lives as long as the process.
+        unsafe { set_root_view(l, compute, srv, param, gpu) };
+    }
+}
+
 macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -1017,6 +1152,8 @@ impl State {
         self.targets.clear();
         let mut views = Vec::with_capacity(handles.len());
         let mut keys = Vec::with_capacity(handles.len());
+        // The formats of the host views, for the draws' pipelines.
+        let mut formats = [0; 9];
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
@@ -1036,6 +1173,9 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
+                    if views.len() < 8 {
+                        formats[views.len()] = desc.Format.0 as u32;
+                    }
                     views.push((None, Some(desc)));
                     keys.push((0, record.key()));
                 }
@@ -1044,7 +1184,11 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            views.push((Some(texture), record.desc()));
+            let desc = record.desc();
+            if views.len() < 8 {
+                formats[views.len()] = bound_format(texture, desc.as_ref().map(|d| d.Format));
+            }
+            views.push((Some(texture), desc));
             keys.push((texture.as_raw() as usize, record.key()));
         }
         self.depth = 0;
@@ -1052,7 +1196,9 @@ impl State {
         let dsv = crate::descriptor::dsv_record(depth).and_then(|record| {
             let texture = crate::resource::host_resource(record.resource)?;
             self.depth = record.resource as usize;
-            self.depth_state = depth_state(texture, record.depth_desc().as_ref());
+            let desc = record.depth_desc();
+            self.depth_state = depth_state(texture, desc.as_ref());
+            formats[8] = bound_format(texture, desc.as_ref().map(|d| d.Format));
             if crate::resource::depth_and_unordered(record.resource) {
                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
             }
@@ -1060,6 +1206,7 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        self.target_formats = formats;
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
@@ -1336,7 +1483,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
             return false;
         };
         if p.compute || p.mesh != mesh {
@@ -1493,7 +1640,7 @@ impl State {
             if t.stores && crate::picked::on() && crate::picked::picks(&stage.shader, &t.picks) {
                 crate::picked::runs_in(list);
             }
-            let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+            let made = self.tables(list, &t.used, &t.host.root_indexed_views, &t.host.half_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
@@ -1593,7 +1740,10 @@ impl State {
                                     l.SetGraphicsRootShaderResourceView(param, gpu);
                                 }
                             },
-                            None => once!("a shader picks buffers from a view heap that is not set"),
+                            None => {
+                                once!("a shader picks buffers from a view heap that is not set");
+                                bind_null_root(l, compute, true, param, slot, None, "no view heap to pick buffers from");
+                            }
                         }
                         continue;
                     }
@@ -1604,6 +1754,9 @@ impl State {
                         // A table left unset is undefined: a null view.
                         if tabled && !self.root_srv_table(list, None, param, compute, false) {
                             return false;
+                        }
+                        if !tabled {
+                            bind_null_root(l, compute, srv, param, slot, None, "the title did not set the root view");
                         }
                         continue;
                     };
@@ -1620,6 +1773,7 @@ impl State {
                         continue;
                     }
                     let Some(mut gpu) = root_view(list, address, srv) else {
+                        bind_null_root(l, compute, srv, param, slot, Some(address), "no host copy holds its address");
                         continue;
                     };
                     if biased {
@@ -3145,11 +3299,19 @@ impl State {
     /// once: its constant data is copied at submission either way, and the
     /// big tables the world binds would otherwise take hundreds of slots per
     /// draw, wrapping the dynamic slots onto lists not yet submitted.
+    ///
+    /// `half`: the table descriptors the shader moves sixteen bits a
+    /// channel as unsigned integers (`HostShader::half_views`). A table
+    /// with a 16-bit float or signed buffer view at one of them is made
+    /// afresh as well, with that view in the unsigned format of the same
+    /// layout (`descriptor::host::half_view`): the title's own slot keeps
+    /// the title's format for the shaders that read it as floats.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
         used: &[UsedResource],
         indexed: &[RootIndexedView],
+        half: &[(u8, u32)],
         compute: bool,
     ) -> Few<(u8, u32), 16> {
         let tables = |u: &&UsedResource| u.root == RootType::Table;
@@ -3157,6 +3319,36 @@ impl State {
         for u in used.iter().filter(tables).filter(|u| u.kind == ResourceType::Cbv) {
             if !fresh.contains(&u.slot) {
                 fresh.push(u.slot);
+            }
+        }
+        // The view shown in place of the title's at dword `at` of the table
+        // in root parameter `slot`, if the shader moves halves there and
+        // the title's view is a 16-bit float or signed buffer view.
+        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
+            if !half.contains(&(slot, at)) {
+                return None;
+            }
+            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
+                return None;
+            };
+            crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
+        };
+        for &(slot, at) in half {
+            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
+                continue;
+            };
+            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
+                continue;
+            };
+            if crate::descriptor::host::half_view(&view).is_some() {
+                if !fresh.contains(&slot) {
+                    fresh.push(slot);
+                }
+            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+                once!(
+                    format,
+                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
+                );
             }
         }
         // Tables reaching past a host heap smaller than the title's (the
@@ -3220,6 +3412,15 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
+            // The descriptors the shader moves halves through are made too,
+            // and the table reaches them: they may lie past the range starts
+            // the entries give (a range of several views names only its
+            // first; review on #927).
+            selected.extend(
+                half.iter()
+                    .filter(|&&(s, _)| s == slot)
+                    .map(|&(_, at)| at / 8),
+            );
             selected.sort_unstable();
             selected.dedup();
             let n = entries()
@@ -3242,6 +3443,9 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     h.add(unsafe { (at as *const [u32; 3]).read_unaligned() });
+                    // (Another table than the same slots made for a shader
+                    // that reads them in the title's formats.)
+                    h.add([u32::from(half.contains(&(slot, k * 8))), 0, 0]);
                 }
                 (table, n, h.0)
             };
@@ -3382,7 +3586,10 @@ impl State {
                         host.constant_at(index, &buffer, gpu, size);
                     }
                     Some(view) => {
-                        host.make_at(index, &view);
+                        match halved(self, slot, k * 8) {
+                            Some(shown) => host.make_at(index, &shown),
+                            None => host.make_at(index, &view),
+                        }
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });
@@ -4014,6 +4221,17 @@ pub(crate) fn view_kind(view: &View) -> Option<ResourceType> {
     }
 }
 
+/// The format of a host view of `texture` whose description names
+/// `described` (none without a description): that one, or the texture's
+/// own, which is what the host gives a view without a format.
+fn bound_format(texture: &ID3D12Resource, described: Option<DXGI_FORMAT>) -> u32 {
+    match described {
+        Some(format) if format.0 != 0 => format.0 as u32,
+        // SAFETY: a live texture.
+        _ => unsafe { texture.GetDesc() }.Format.0 as u32,
+    }
+}
+
 /// The host state a depth view needs of its texture: the read state if the
 /// view writes no plane the format has (the title's read-only flags), else
 /// the write state.
@@ -4044,7 +4262,7 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
 
 /// A few things, up to `N` of them without memory of the heap: what a draw's
 /// tables are gone through with, some six lists a stage.
-struct Few<T, const N: usize> {
+pub(crate) struct Few<T, const N: usize> {
     few: [T; N],
     len: usize,
     /// All of them, if they are more.
@@ -4467,5 +4685,54 @@ mod record_hash_tests {
         // (One record of zeros is among the above.)
         let zeros: Vec<u64> = (2..100).map(|n| of(&vec![[0; 3]; n])).collect();
         assert!(zeros.iter().all(|h| seen.insert(*h)));
+    }
+}
+
+#[cfg(test)]
+mod null_root_tests {
+    use super::*;
+
+    /// The default adapter's device (the card, through the host's D3D12).
+    fn device() -> Option<ID3D12Device> {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device creation.
+        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device).ok()? };
+        device
+    }
+
+    #[test]
+    fn the_null_root_view_is_a_zeroed_constant_buffer_sized_buffer() {
+        let Some(device) = device() else {
+            eprintln!("no D3D12 device: skipped");
+            return;
+        };
+        let null = make_null_root(&device).expect("a null root buffer");
+        assert_ne!(null.gpu, 0);
+        assert_eq!(
+            null.gpu % 256,
+            0,
+            "a constant buffer view must be 256-byte aligned"
+        );
+        // SAFETY: our own buffer.
+        let desc = unsafe { null.buffer.GetDesc() };
+        assert!(
+            desc.Width >= NULL_ROOT_BYTES,
+            "covers the largest constant buffer"
+        );
+        let mut data = std::ptr::null_mut();
+        // SAFETY: an upload buffer, mapped for reading its bytes.
+        unsafe { null.buffer.Map(0, None, Some(&mut data)).unwrap() };
+        // SAFETY: mapped, `Width` bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), desc.Width as usize) };
+        assert!(bytes.iter().all(|&b| b == 0), "reads as zeros");
+    }
+
+    #[test]
+    fn null_roots_are_counted() {
+        let before = NULL_ROOTS.load(Ordering::Relaxed);
+        note_null_root("test", 3, Some(0x1234));
+        note_null_root("test", 3, None);
+        assert_eq!(NULL_ROOTS.load(Ordering::Relaxed), before + 2);
     }
 }

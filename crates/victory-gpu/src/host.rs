@@ -707,8 +707,13 @@ fn card_clock_watch(clock: &'static CardClock) {
         };
         // SAFETY: the clock's fence and this thread's event.
         unsafe {
-            if clock.fence.SetEventOnCompletion(target, event).is_ok() {
-                WaitForSingleObject(event, INFINITE);
+            // The clock only counts: with the device gone it stops, and
+            // whoever waits for the work reports the loss.
+            if clock.fence.SetEventOnCompletion(target, event).is_ok()
+                && let Some(host) = host()
+                && !wait_card(&host.device, event)
+            {
+                return;
             }
         }
         seen = target;
@@ -792,6 +797,103 @@ pub fn on_failure(report: fn(&str) -> !) {
     let _ = ON_FAILURE.set(report);
 }
 
+/// How long a wait for the card goes before it asks whether the device is
+/// gone ([`wait_card`]).
+#[cfg(not(test))]
+const CARD_WAIT_SLICE: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const CARD_WAIT_SLICE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Waits for `event`, which a fence of `device` sets (`SetEventOnCompletion`),
+/// in slices of [`CARD_WAIT_SLICE`], asking between them whether the device
+/// is gone. True once the event is set; false if the device was removed.
+///
+/// A wait without end hid every lost device on Linux: there the host's
+/// D3D12 sets no fence event once the card has faulted, so the thread that
+/// lands flights waited for good, nothing reported the loss (with its
+/// command trail), and the title, its frames stopped, crashed itself on its
+/// own GPU timeout a minute later (runs bc-1, 6 and 9 of 2026-11-25).
+fn wait_card(device: &ID3D12Device, event: HANDLE) -> bool {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    let slice = CARD_WAIT_SLICE.as_millis() as u32;
+    loop {
+        // SAFETY: an event of the caller's.
+        if unsafe { WaitForSingleObject(event, slice) } == WAIT_OBJECT_0 {
+            return true;
+        }
+        // SAFETY: a plain query.
+        if unsafe { device.GetDeviceRemovedReason() }.is_err() {
+            return false;
+        }
+    }
+}
+
+/// Lists [`SentNotes`] keeps, and commands it keeps of each.
+#[cfg(feature = "diagnostics")]
+const SENT_KEPT: usize = 12;
+#[cfg(feature = "diagnostics")]
+const SENT_COMMANDS: usize = 8;
+
+/// The last lists sent to the card and the last commands noted in each
+/// (diagnostics, with `VICTORY_D3D12_DRED`), for the device-loss report
+/// whichever thread finds the device gone: the thread that lands flights
+/// has taken them off the line by then, and the copy-back of the card's
+/// copies (where a loss was found in run bd-1) never held them.
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct SentNotes(std::collections::VecDeque<(u64, usize, Vec<String>)>);
+
+#[cfg(feature = "diagnostics")]
+impl SentNotes {
+    fn push(&mut self, submission: u64, notes: &[String]) {
+        let last = notes[notes.len().saturating_sub(SENT_COMMANDS)..].to_vec();
+        self.0.push_back((submission, notes.len(), last));
+        while self.0.len() > SENT_KEPT {
+            self.0.pop_front();
+        }
+    }
+
+    fn text(&self) -> String {
+        let mut text = String::new();
+        for (submission, all, last) in &self.0 {
+            text.push_str(&format!(
+                "\n  submission {submission}, a list of {all} commands, its last: {}",
+                last.join(" | ")
+            ));
+        }
+        text
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+static SENT: Mutex<Option<SentNotes>> = Mutex::new(None);
+
+/// Keeps the notes of `runs`, about to be sent as `submission` ([`SentNotes`]).
+#[cfg(feature = "diagnostics")]
+fn remember_sent(submission: u64, runs: &[&HostList]) {
+    if !dred_on() {
+        return;
+    }
+    let mut sent = SENT.lock().unwrap_or_else(|e| e.into_inner());
+    let sent = sent.get_or_insert_with(SentNotes::default);
+    for run in runs {
+        let notes: Vec<String> = run
+            .notes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect();
+        sent.push(submission, &notes);
+    }
+}
+
+/// The error a wait for the card gives when [`wait_card`] found the device
+/// gone.
+fn card_gone() -> windows::core::Error {
+    windows::core::Error::from(windows::Win32::Graphics::Dxgi::DXGI_ERROR_DEVICE_REMOVED)
+}
+
 /// Ends the run on a host GPU failure: what failed, the removal reason and
 /// the debug layer's first error, if any (`VICTORY_D3D12_DEBUG=1` in a
 /// diagnostics build names the command).
@@ -802,6 +904,17 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
         if let Err(e) = unsafe { host.device.GetDeviceRemovedReason() } {
             text.push_str(&format!("; device removed: {e}"));
             log_removal_context();
+            #[cfg(feature = "diagnostics")]
+            if let Ok(sent) = SENT.try_lock()
+                && let Some(sent) = sent.as_ref()
+            {
+                tracing::error!("the last lists sent to the card before it was lost:{}", sent.text());
+            }
+            // The host's own report of a lost device (vkd3d-proton's
+            // breadcrumbs, `VKD3D_CONFIG=breadcrumbs`) comes from its own
+            // thread once it notices: a run that ends at once cuts it off.
+            #[cfg(all(feature = "diagnostics", not(test)))]
+            std::thread::sleep(std::time::Duration::from_secs(3));
         }
         match host.log_messages() {
             Some(first) => text.push_str(&format!("; debug layer: {first}")),
@@ -935,7 +1048,17 @@ fn create() -> windows::core::Result<Host> {
             .is_ok()
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            // `VICTORY_HOST_WAVE=32`: translate as for a card whose waves are at most 32 lanes (as
+            // `victory warm` takes it), to compare the two forms of wave64 programs on one card.
+            let widest = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&n| n == 32 || n == 64)
+                .unwrap_or(o1.WaveLaneCountMax);
+            if widest != o1.WaveLaneCountMax {
+                tracing::warn!(widest, "host waves taken as at most this wide (VICTORY_HOST_WAVE)");
+            }
+            victory_shader::emit::set_host_max_wave(widest);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);
@@ -1118,6 +1241,55 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn sent_notes_keep_the_last_lists_and_their_last_commands() {
+        let mut ring = SentNotes::default();
+        for n in 0..SENT_KEPT as u64 + 3 {
+            let notes: Vec<String> = (0..SENT_COMMANDS + 2).map(|c| format!("s{n} c{c}")).collect();
+            ring.push(n, &notes);
+        }
+        let text = ring.text();
+        assert!(!text.contains("submission 2,"), "the oldest lists are dropped: {text}");
+        assert!(text.contains(&format!("submission {},", SENT_KEPT + 2)), "{text}");
+        let last = SENT_KEPT + 2;
+        assert!(text.contains(&format!("s{last} c{}", SENT_COMMANDS + 1)), "the newest command is kept");
+        assert!(!text.contains(&format!("s{last} c1 ")), "only the last commands of a list: {text}");
+    }
+
+    #[test]
+    fn a_card_wait_ends_when_the_fence_is_set_after_several_slices() {
+        use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_12_0;
+        let mut device: Option<ID3D12Device> = None;
+        // SAFETY: plain device and object creation on the default adapter.
+        let made = unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device) };
+        let Some(device) = made.ok().and(device) else {
+            eprintln!("no D3D12 device: skipped");
+            return;
+        };
+        // SAFETY: as above.
+        let (fence, event) = unsafe {
+            (
+                device.CreateFence::<ID3D12Fence>(0, D3D12_FENCE_FLAG_NONE).unwrap(),
+                CreateEventW(None, false, false, None).unwrap(),
+            )
+        };
+        // SAFETY: our fence and event.
+        unsafe { fence.SetEventOnCompletion(1, event).unwrap() };
+        let setter = {
+            let fence = fence.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(CARD_WAIT_SLICE * 2 + CARD_WAIT_SLICE / 2);
+                // SAFETY: our fence.
+                unsafe { fence.Signal(1).unwrap() };
+            })
+        };
+        let started = std::time::Instant::now();
+        assert!(wait_card(&device, event), "the device is alive: the wait ends when the fence is set");
+        assert!(started.elapsed() >= CARD_WAIT_SLICE * 2, "it waited across slices");
+        setter.join().unwrap();
+    }
 
     #[test]
     fn warp_adapter_accepts_only_software() {
@@ -2246,6 +2418,14 @@ struct Deferred {
     filled: std::collections::HashMap<(usize, usize), u64, std::hash::BuildHasherDefault<AddressHash>>,
     /// Textures whose contents the list brings up to date.
     textures: std::collections::HashSet<usize>,
+    /// Last GPU source copied into each aliased host texture in this list.
+    texture_aliases: std::collections::HashMap<usize, usize>,
+    /// Title-written textures whose staging buffer is copied into the host
+    /// texture in this list's prelude if refreshed or not uploaded yet.
+    texture_uploads: Vec<(
+        std::sync::Arc<crate::resource::HostTexture>,
+        std::sync::Arc<crate::texture::Staging>,
+    )>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
     writes: Vec<(usize, crate::queue::Written, usize)>,
@@ -3291,7 +3471,9 @@ fn late_helper() {
             if host.fence.SetEventOnCompletion(target, event).is_ok() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
-                WaitForSingleObject(event, INFINITE);
+                if !wait_card(&host.device, event) {
+                    fail(format_args!("host GPU device removed while waiting for submissions sent ahead (VICTORY_LATE_WAIT)"));
+                }
             }
         }
         {
@@ -3451,11 +3633,11 @@ fn relay_worker() {
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(Some(target));
                 // SAFETY: the host's fence and this thread's event.
-                let waited = unsafe {
-                    host.fence.SetEventOnCompletion(target, event).map(|()| {
-                        WaitForSingleObject(event, INFINITE);
-                    })
-                };
+                let waited = unsafe { host.fence.SetEventOnCompletion(target, event) }.map(|()| {
+                    if !wait_card(&host.device, event) {
+                        host.relay_lost();
+                    }
+                });
                 if waited.is_err() {
                     std::thread::sleep(std::time::Duration::from_millis(1));
                 }
@@ -3688,6 +3870,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod dots;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -4794,7 +4977,9 @@ impl Host {
                 fence.SetEventOnCompletion(sent, event)?;
                 #[cfg(feature = "diagnostics")]
                 let _card = crate::timeline::card_wait(None);
-                WaitForSingleObject(event, INFINITE);
+                if !wait_card(&self.device, event) {
+                    return Err(card_gone());
+                }
                 Ok(after)
             })()
         };
@@ -4879,6 +5064,28 @@ impl Host {
     /// then, in the line's order, each flight's read-backs, its
     /// bottom-of-pipe writes and the fence signals behind it. Title memory
     /// is complete before the title is told anything.
+    /// The thread that lands flights found the device gone while it waited
+    /// for the card ([`wait_card`]): ends the run with the last things done
+    /// in every list still in the air, as a landing that finds it gone does.
+    fn relay_lost(&self) -> ! {
+        let line = line();
+        let runs: Vec<&HostList> = line
+            .line
+            .iter()
+            .filter_map(|l| match l {
+                Late::Run(flight) => Some(flight),
+                _ => None,
+            })
+            .flat_map(|f| f.order.iter().map(|&i| f.lists[i].host()))
+            .collect();
+        fail(format_args!(
+            "host GPU device removed while the relay waited for the card (VICTORY_RELAY=1), {} lists in the air{}{}",
+            runs.len(),
+            self.removal_data(&runs),
+            last_notes(&runs)
+        ));
+    }
+
     fn relay_land(&self, items: Vec<Late>, fetch: &mut Option<RelayFetch>) {
         let landing = std::time::Instant::now();
         let mut stage = crate::timeline::span("landing: what is to be looked through");
@@ -5082,7 +5289,9 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    if !wait_card(&self.device, self.event) {
+                        return Err(card_gone());
+                    }
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -5351,7 +5560,8 @@ impl Host {
                             working(false);
                             #[cfg(feature = "diagnostics")]
                             let _card = crate::timeline::card_wait(Some(*submitted));
-                            WaitForSingleObject(self.event, INFINITE);
+                            // A gone device ends the wait; the check below reports it.
+                            wait_card(&self.device, self.event);
                             stood(waiting);
                             working(true);
                         }
@@ -5647,6 +5857,11 @@ impl Host {
         stage.next("submit: the lists' steps");
         for list in runs {
             list.run_deferred(&mut batch, &air, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+            // Textures this list's prelude may copy: their checks, batched
+            // over threads, are done before it looks at what they found.
+            if !list.deferred().texture_uploads.is_empty() {
+                batch.refresh_textures();
+            }
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
                 lists.push(Some(prelude));
@@ -5707,6 +5922,8 @@ impl Host {
         crate::descriptor::make_waiting();
         #[cfg(feature = "diagnostics")]
         split.part(15);
+        #[cfg(feature = "diagnostics")]
+        remember_sent(this_submission, runs);
         let prepared = std::time::Instant::now();
         stage.next("submit: sending");
         // When it runs on the card, for the timeline.
@@ -5801,7 +6018,8 @@ impl Host {
                         working(false);
                         #[cfg(feature = "diagnostics")]
                         let _card = crate::timeline::card_wait(Some(*submitted));
-                        WaitForSingleObject(self.event, INFINITE);
+                        // A gone device ends the wait; the check below reports it.
+                        wait_card(&self.device, self.event);
                         stood(started);
                         working(true);
                     }
@@ -6578,11 +6796,34 @@ impl HostList {
     /// its real state to the one the list starts with; the textures' real
     /// states become those the list ends with. For depth textures with a
     /// colour twin it first copies the side the list uses as it finds it
-    /// from the other, if a list submitted earlier left it behind.
+    /// from the other, if a list submitted earlier left it behind. For
+    /// title-written textures whose staging buffer was refreshed (or has
+    /// not been uploaded yet) it copies the staging buffer into the host
+    /// texture before the list uses it.
     fn prelude(&self) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
         let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
+        // `run_deferred` has already refreshed each staging buffer, so we
+        // know here exactly which textures need a GPU copy on this submission.
+        let uploads: Vec<_> = {
+            let deferred = self.deferred();
+            deferred
+                .texture_uploads
+                .iter()
+                .filter_map(|(copy, staging)| {
+                    if staging.take_upload() {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::TexUploads, 1);
+                        Some((copy.clone(), staging.clone()))
+                    } else {
+                        #[cfg(feature = "diagnostics")]
+                        crate::copystat::add(crate::copystat::C::TexSkipped, 1);
+                        None
+                    }
+                })
+                .collect()
+        };
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -6634,13 +6875,35 @@ impl HostList {
                 }
             }
         }
+        for (copy, _) in &uploads {
+            let key = std::sync::Arc::as_ptr(copy) as usize;
+            if copying.contains_key(&key) {
+                continue;
+            }
+            let real = copy.state.load(Ordering::Relaxed);
+            copying.insert(key, COPY_DEST);
+            if real != COPY_DEST {
+                to_copy.push(transition(
+                    &copy.texture,
+                    host_state(real),
+                    host_state(COPY_DEST),
+                ));
+                if !states.contains_key(&key) {
+                    barriers.push(transition(
+                        &copy.texture,
+                        host_state(COPY_DEST),
+                        host_state(real),
+                    ));
+                }
+            }
+        }
         barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
             let real = copy.state.swap(*last, Ordering::Relaxed);
             let real = copying.get(key).copied().unwrap_or(real);
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        if barriers.is_empty() && syncs.is_empty() && uploads.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6660,6 +6923,9 @@ impl HostList {
                 }
                 for (depth, twin, colour) in &syncs {
                     record_twin_copy(list, &depth.texture, twin, *colour);
+                }
+                for (copy, staging) in &uploads {
+                    staging.record_copy(list, &copy.texture);
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
@@ -6729,6 +6995,7 @@ impl HostList {
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
                 && deferred.textures.is_empty()
+                && deferred.texture_uploads.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
                 && deferred.texture_backs.is_empty())
@@ -7198,6 +7465,12 @@ impl HostList {
         self.deferred().textures.contains(&key)
     }
 
+    pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+        let view = view.as_raw() as usize;
+        let source = source.as_raw() as usize;
+        self.deferred().texture_aliases.insert(view, source) != Some(source)
+    }
+
     /// Runs `work` when the list is submitted, in order with its copies.
     /// `work` may write title memory (refreshes after it copy again).
     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
@@ -7223,6 +7496,16 @@ impl HostList {
     /// submitted, keeping it alive until the list is reset.
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
+    }
+
+    /// Copies `staging` into `copy` in this list's prelude when submitted,
+    /// if `staging` has not been uploaded yet or was detiled by `refresh`.
+    pub(crate) fn defer_texture_upload(
+        &self,
+        copy: std::sync::Arc<crate::resource::HostTexture>,
+        staging: std::sync::Arc<crate::texture::Staging>,
+    ) {
+        self.deferred().texture_uploads.push((copy, staging));
     }
 
     /// Runs the list's submission-time steps; refreshes go into `batch`
@@ -8576,8 +8859,25 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// The loading bar of the pipelines made at the start
+    /// (`crate::pipeline::prepare`), and when its text was last asked for.
+    loading: (dots::Overlay, std::time::Instant),
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
+}
+
+/// The loading bar's box: one line ("preparing shaders" and how far) over
+/// a bar three dots high.
+const LOADING: dots::Layout = dots::Layout {
+    columns: crate::pipeline::LOADING_COLUMNS as u32,
+    lines: 1,
+    bar: 3,
+};
+
+/// Pixels to a dot of the loading bar's box for a picture that high: three
+/// on a 1080-line picture, the box 450 by 54 pixels.
+fn loading_scale(height: u32) -> u32 {
+    (height / 360).max(1)
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -8927,11 +9227,13 @@ impl Meter {
         }
         let Some(caption) = &self.caption else { return };
         let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
-        text.push(0);
+        let text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
         // Setting the text waits for the window's thread (a title thread,
         // which may not pump for a while), so a thread of ours does it and
-        // presenting never waits; it takes the newest text when free.
+        // presenting never waits; it takes the newest text when free. It
+        // also adds the pipelines being compiled, looked at four times a
+        // second: a loading frame can take seconds, and that is when most
+        // are compiled.
         static PENDING: Mutex<Option<(usize, Vec<u16>)>> = Mutex::new(None);
         static SETTER: std::sync::Once = std::sync::Once::new();
         *PENDING.lock().unwrap_or_else(|e| e.into_inner()) = Some((hwnd.0 as usize, text));
@@ -8939,15 +9241,29 @@ impl Meter {
             let _ = std::thread::Builder::new()
                 .name("victory-caption".into())
                 .spawn(|| {
+                    let mut shown: Option<(usize, Vec<u16>)> = None;
+                    let mut compiling_shown = u64::MAX;
                     loop {
                         let next = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take();
-                        match next {
-                            // SAFETY: a window handle and a NUL-terminated text.
-                            Some((hwnd, text)) => unsafe {
-                                let _ = SetWindowTextW(HWND(hwnd as *mut _), PCWSTR(text.as_ptr()));
-                            },
-                            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+                        let compiling = crate::pipeline::making();
+                        if next.is_some() || compiling != compiling_shown {
+                            if let Some(next) = next {
+                                shown = Some(next);
+                            }
+                            if let Some((hwnd, base)) = &shown {
+                                let mut text = base.clone();
+                                if compiling > 0 {
+                                    text.extend(format!(", {compiling} pipelines compiling").encode_utf16());
+                                }
+                                text.push(0);
+                                // SAFETY: a window handle and a NUL-terminated text.
+                                unsafe {
+                                    let _ = SetWindowTextW(HWND(*hwnd as *mut _), PCWSTR(text.as_ptr()));
+                                }
+                                compiling_shown = compiling;
+                            }
                         }
+                        std::thread::sleep(std::time::Duration::from_millis(250));
                     }
                 });
         });
@@ -9053,6 +9369,16 @@ impl Host {
             let watched = crate::popwatch::take(&self.device, list, texture);
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
+            {
+                let (overlay, asked) = &mut p.loading;
+                if asked.elapsed() >= std::time::Duration::from_millis(250) {
+                    *asked = std::time::Instant::now();
+                    overlay.set_bar(crate::pipeline::loading());
+                }
+                #[cfg(feature = "diagnostics")]
+                let _ours = crate::replay::record::unrecorded();
+                overlay.draw(self, copy, &back, (width, height), format, loading_scale(height));
+            }
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
@@ -9144,6 +9470,10 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                loading: (
+                    dots::Overlay::new(LOADING, dots::Place::LowMiddle),
+                    std::time::Instant::now() - std::time::Duration::from_secs(1),
+                ),
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })

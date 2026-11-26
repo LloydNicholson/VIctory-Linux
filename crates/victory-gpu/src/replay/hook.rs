@@ -150,6 +150,34 @@ pub(super) unsafe fn ours(this: *mut c_void) -> bool {
     MADE.lock().unwrap_or_else(|e| e.into_inner()).contains(&at)
 }
 
+/// Runs `f` with the objects pointing at their own tables, then at their
+/// shims again. vkd3d-proton (D3D12 under Proton) takes a submitted list
+/// only if it points at vkd3d's own table: with a shim it is not known, and
+/// vkd3d reads through a null list. On Windows nothing looks at the table.
+///
+/// # Safety
+/// Live COM objects; no other thread calls them during `f` (a list being
+/// submitted is closed and its owner submits it).
+pub(super) unsafe fn bare<R>(objects: &[*mut c_void], f: impl FnOnce() -> R) -> R {
+    let mut put = Vec::with_capacity(objects.len());
+    for &o in objects {
+        // SAFETY: the caller's; a shim's `orig` is the object's own table.
+        unsafe {
+            if !o.is_null() && ours(o) {
+                let at = table(o);
+                o.cast::<*const usize>().write((*shim(o)).orig);
+                put.push((o, at));
+            }
+        }
+    }
+    let r = f();
+    for (o, at) in put {
+        // SAFETY: as above: the shim it pointed at before.
+        unsafe { o.cast::<usize>().write(at) };
+    }
+    r
+}
+
 /// After a method that may have set the object's table pointer anew: it
 /// points at its shim (`before`, where it pointed) again. A table it did
 /// not have before gets a shim of its own.

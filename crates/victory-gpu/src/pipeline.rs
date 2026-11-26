@@ -456,6 +456,24 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`: if a bound view has another format than the title's
+/// pipeline declares for its slot (`host::formats_differ`), the host
+/// pipeline of the same shaders and state made for the bound formats
+/// (`make::for_formats`). A draw whose views are as declared pays one
+/// comparison of the nine words.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
@@ -564,7 +582,10 @@ fn hand_out(
 ) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
-    let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
+    let host = make::shared(make::Pending::new(shaders.clone(), graphics));
+    // The first: the pipelines earlier runs drew with are made from here on.
+    #[cfg(windows)]
+    prepare::kick();
     #[cfg(windows)]
     known::note(host.key(), &shaders, host.graphics.as_deref());
     #[cfg(windows)]
@@ -760,6 +781,20 @@ pub mod known;
 mod library;
 #[cfg(windows)]
 mod make;
+#[cfg(windows)]
+mod prepare;
+
+/// What the loading bar's box of the pipelines made at the start
+/// (`prepare`) shows: its line and how full its bar is; none when nothing
+/// is being made.
+#[cfg(windows)]
+pub(crate) fn loading() -> Option<(String, f64)> {
+    prepare::shown()
+}
+
+/// Characters in the loading bar's line.
+#[cfg(windows)]
+pub(crate) const LOADING_COLUMNS: usize = prepare::COLUMNS;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.

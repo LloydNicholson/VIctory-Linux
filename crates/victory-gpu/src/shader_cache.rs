@@ -75,12 +75,19 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_HALF_VIEWS",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
             if let Some(value) = std::env::var_os(name) {
                 bytes.extend_from_slice(value.as_encoded_bytes());
             }
+            bytes.push(0);
+        }
+        // A host wave width taken from `VICTORY_HOST_WAVE` (only when set, so other runs keep their keys).
+        if let Some(value) = std::env::var_os("VICTORY_HOST_WAVE") {
+            bytes.extend_from_slice(b"VICTORY_HOST_WAVE=");
+            bytes.extend_from_slice(value.as_encoded_bytes());
             bytes.push(0);
         }
         // And which clean-up passes ran over the translated code.
@@ -267,6 +274,11 @@ fn encode(s: &HostShader) -> Vec<u8> {
             word(&mut out, value);
         }
     }
+    word(&mut out, s.half_views.len() as u32);
+    for &(slot, dword) in &s.half_views {
+        word(&mut out, u32::from(slot));
+        word(&mut out, dword);
+    }
     out
 }
 
@@ -335,6 +347,11 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
         });
     }
+    let n = r.word()? as usize;
+    let mut half_views = Vec::with_capacity(n.min(256));
+    for _ in 0..n {
+        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
+    }
     r.0.is_empty().then_some(HostShader {
         stage,
         dxil,
@@ -345,6 +362,7 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
         root_srvs,
         root_uavs,
         root_indexed_views,
+        half_views,
     })
 }
 
@@ -379,6 +397,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: vec![(0, 8), (4, 0)],
         }
     }
 

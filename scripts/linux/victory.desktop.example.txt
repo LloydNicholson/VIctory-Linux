@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=VIctory (Linux)
+Comment=GTA VI on VIctory under Proton
+# Edit both paths: this repository's scripts/linux/play.sh and your play.conf.
+Exec=/path/to/VIctory-Linux/scripts/linux/play.sh /path/to/play.conf
+Icon=applications-games
+Terminal=false
+Categories=Game;
+StartupNotify=false

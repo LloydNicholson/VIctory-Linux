@@ -25,6 +25,11 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+/// Format loads that move 16-bit halves without the d16 form, a child
+/// module so it shares the emitter's state.
+#[path = "halves.rs"]
+mod halves;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -55,6 +60,8 @@ pub(crate) struct Lowered {
     pub root_cbvs: Vec<u8>,
     pub root_srvs: Vec<u8>,
     pub root_uavs: Vec<u8>,
+    /// See [`super::HostShader::half_views`].
+    pub half_views: Vec<(u8, u32)>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
     /// The wave size the shader requires of the host, if any.
@@ -295,6 +302,11 @@ struct Lower<'a> {
     params: HashMap<Value, (usize, u32)>,
     user_data: Option<V>,
     user_reads: BTreeMap<u32, UserData>,
+    /// Table descriptors read or written sixteen bits a channel
+    /// ([`super::HostShader::half_views`]): root parameter, dword offset.
+    half_views: std::collections::BTreeSet<(u8, u32)>,
+    /// [`Self::places_read_as_halves`], found before the code is lowered.
+    halves_only: std::collections::BTreeSet<(u8, u32)>,
     samplers: Vec<[u32; 4]>,
     descriptors: HashMap<(Site, bool), &'a Source>,
     scalar: HashMap<Site, Address>,
@@ -1635,6 +1647,8 @@ impl<'a> Lower<'a> {
             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
             user_data: None,
             user_reads: BTreeMap::new(),
+            half_views: Default::default(),
+            halves_only: Default::default(),
             samplers: Vec::new(),
             descriptors: x
                 .res
@@ -2246,6 +2260,11 @@ impl<'a> Lower<'a> {
         } else {
             all_lane_blocks(self.x.st).is_some_and(|all| all.get(self.cur_ir).copied().unwrap_or(false))
         };
+        // (Not where two host waves would exchange through LDS behind a
+        // barrier, which lanes that do not run here never reach. On one host
+        // wave of 64 the lanes that are elsewhere are handled below: this
+        // tree's own form, not the fork's `half_sum_running`, which stood in
+        // front of it after the merge.)
         if !every && halves {
             need(self.cur_ir);
             return Err(WHERE);
@@ -2335,6 +2354,8 @@ impl<'a> Lower<'a> {
             self.s.entry = body;
         }
         self.find_coherent();
+        // (Nothing moves halves as integers unless `VICTORY_HALF_VIEWS=1`.)
+        self.halves_only = if super::half_views_on() { self.places_read_as_halves() } else { Default::default() };
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
             self.rpo[b] = n;
@@ -2420,6 +2441,7 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
+        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
         let cmp_samplers = self.s.cmp_samplers;
         let wave_size = self.s.wave_size;
         Ok(Lowered {
@@ -2428,6 +2450,7 @@ impl<'a> Lower<'a> {
             root_cbvs,
             root_srvs,
             root_uavs,
+            half_views,
             #[cfg(test)]
             nonuniform_handles: self.s.nonuniform_handles,
             #[cfg(test)]
@@ -6160,16 +6183,24 @@ impl<'a> Lower<'a> {
         // BatchCullPreSkinnedMeshlets, BatchCullBatchCSMeshlets) reads its
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
-        // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // The host's table of strides by heap slot tells a buffer view (a
+        // stride), a constant buffer (`SLOT_CONSTANT_BUFFER`) and anything
+        // else (0) apart; only the load that fits the slot runs, and a slot
+        // that is neither reads zeros, as the console's hardware gives for
+        // a descriptor with no buffer behind it. (Read as a constant buffer,
+        // a texture's or an empty slot faulted the card at address 0 on the
+        // host's D3D12 on Linux: fork issue #698, item 4.)
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
         };
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let constant = self.s.m.i32(super::shader::SLOT_CONSTANT_BUFFER);
+            let c = self.cur;
+            let some = self.s.m.cmp(c, pred::NE, stride, zero);
+            let not_cb = self.s.m.cmp(c, pred::NE, stride, constant);
+            let is_buffer = self.s.m.bin(c, Bin::And, some, not_cb);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -6197,7 +6228,7 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            let other = self.s.m.cmp(self.cur, pred::EQ, stride, constant);
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
@@ -6482,7 +6513,15 @@ impl<'a> Lower<'a> {
                 let props = if un.starts_with("buffer_load_format")
                     || un.starts_with("buffer_store_format")
                 {
-                    (10 | u, 0x409)
+                    // (Unsigned integers where the access moves halves.)
+                    let halves = self
+                        .table_place(&Source::Loaded { load: site, first })
+                        .is_some_and(|p| {
+                            self.halves_only.contains(&p)
+                                && (un.contains("_format_d16_")
+                                    || self.format_load_read_as_halves(ui))
+                        });
+                    (10 | u, if halves { 0x405 } else { 0x409 })
                 } else if !counted
                     && *idxen
                     && format.is_none()
@@ -7120,6 +7159,22 @@ impl<'a> Lower<'a> {
             .find(|u| u.user_data == rp.user_data)
             .map(|u| u.kind);
         (kind == Some(ResourceType::Uav)).then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
+    }
+
+    /// The table descriptor `src` is, as (root parameter, dword in the
+    /// table), when the code loads it from a fixed place in a table: the
+    /// load's own place, not the start of the range its used-resource
+    /// entry describes (a range of several descriptors starts before most
+    /// of them). `None` for a descriptor picked at run time, built in the
+    /// code or chosen by control flow.
+    fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
+        let Source::Loaded { load, first } = src else {
+            return None;
+        };
+        let a = self.scalar.get(load)?;
+        let rp = self.x.native.layout.get(a.param)?;
+        (rp.root == RootType::Table && a.dynamic.is_none())
+            .then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
     }
 
     /// The used-resource entry a descriptor loaded from a table falls in.
@@ -11630,6 +11685,23 @@ impl<'a> Lower<'a> {
             .copied()
             .ok_or("an untracked buffer")?;
         let used = self.used_kind(src);
+        // Sixteen bits a channel through a view of a table: the bits go as
+        // they are, as unsigned integers, and the host is told, which shows
+        // the shader a 16-bit float view there as its unsigned twin
+        // ([`super::HostShader::half_views`]).
+        // A format load of whole dwords whose every use reads one half of a
+        // result as a half float moves 16-bit integers too (the head
+        // program's reads of the face network's output), where every
+        // access through its view does ([`Self::places_read_as_halves`]).
+        // A d16 access too only where every access does: a whole float
+        // read through the same place would see the unsigned twin.
+        let place = typed.then(|| self.table_place(src)).flatten().filter(|p| {
+            self.halves_only.contains(p) && (d16 || self.format_load_read_as_halves(inst))
+        });
+        let halves = place.is_some();
+        if let Some(place) = place {
+            self.half_views.insert(place);
+        }
         let (base, extra) = self.built_offset(src)?;
         if base != 0 {
             let b = self.s.m.i32(base);
@@ -11861,6 +11933,8 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             if d16 {
+                // Through a view of a table each half is stored as it is
+                // (`halves`). Reached another way:
                 // d16 data is taken as f16, widened for the 32-bit float
                 // store; through a view of an integer format it is a 16-bit
                 // integer, zero- or sign-extended (VIctory 4243a96a: the face
@@ -11868,13 +11942,18 @@ impl<'a> Lower<'a> {
                 // noise). shortcut: that is known of the views a program
                 // picks from the heap, not of those in its tables; and the
                 // handle stays a float one, whose bits the drivers pass.
-                let integer = if typed { self.integer_view(src)? } else { None };
+                let integer = if typed && !halves { self.integer_view(src)? } else { None };
                 let mut wide = Vec::new();
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
+                    }
+                    if halves {
+                        let low = self.s.m.i32(0xffff);
+                        wide.push(self.s.m.bin(c, Bin::And, x, low));
+                        continue;
                     }
                     let f32t = self.s.t.f32;
                     let f = self
@@ -11900,12 +11979,21 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
+                // Four unsigned integers for halves, four floats otherwise.
+                let component = if halves { 0x405 } else { 0x409 };
+                args.push(self.handle(site, src, false, (10 | u, component))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
-                    args.push(self.as_float(x));
+                    args.push(if halves { x } else { self.as_float(x) });
                 }
-                (69, "bufferStore.f32")
+                (
+                    69,
+                    if halves {
+                        "bufferStore.i32"
+                    } else {
+                        "bufferStore.f32"
+                    },
+                )
             } else {
                 match index {
                     // A raw buffer (stride 1) written by index: the index is the byte.
@@ -11965,13 +12053,21 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
+            let ty = if halves { 0x405 } else { 0x409 };
+            let h = self.handle(site, src, false, (10 | u, ty))?;
             let index = index.unwrap_or(self.s.m.i32(0));
+            // Through a view of a table, halves are read as the unsigned
+            // integers they are (see the stores above).
+            let ret = if halves {
+                self.s.m.named_struct("dx.types.ResRet.i32", vec![self.s.t.i32; 5])
+            } else {
+                self.s.t.res_ret
+            };
             self.s.op(
                 c,
-                "bufferLoad.f32",
+                if halves { "bufferLoad.i32" } else { "bufferLoad.f32" },
                 Attr::ReadOnly,
-                self.s.t.res_ret,
+                ret,
                 68,
                 &[h, index, iu],
             )
@@ -12025,17 +12121,21 @@ impl<'a> Lower<'a> {
         };
         if d16 {
             // Two f16 channels per VGPR (an odd last high half 0); the low
-            // 16 bits of an integer view's (see the stores above).
-            let integer = if typed { self.integer_view(src)? } else { None };
+            // 16 bits of an integer view's (see the stores above); through
+            // a view of a table, the 16 bits of each as they are.
+            let integer = if typed && !halves { self.integer_view(src)? } else { None };
             let k16 = self.s.m.i32(16);
             let i32t = self.s.t.i32;
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let mut h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    let mut h = if halves {
+                        let low = self.s.m.i32(0xffff);
+                        self.s.m.bin(c, Bin::And, f, low)
+                    } else {
+                        self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                    };
                     if let Some((int, _)) = integer {
                         let bits = self.as_int(f);
                         let low = self.s.m.i32(0xFFFF);
@@ -12056,7 +12156,8 @@ impl<'a> Lower<'a> {
         }
         for k in 0..count {
             let x = self.s.m.extract(c, r, k);
-            let x = self.as_int(x);
+            // (Integers already where the load moved halves.)
+            let x = if halves { x } else { self.as_int(x) };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -13111,6 +13212,113 @@ mod tests {
             perm_features(256) & 0x8000,
             0,
             "dynamic v_perm_b32 must not require INT64"
+        );
+    }
+
+    /// A compute program of `threads` in a wave64 build, lowered for a host
+    /// whose waves reach 64 lanes (AMD), with 512 bytes of LDS.
+    fn lower_wave64_host(words: &[u32], threads: [u32; 3]) -> Result<Lowered, crate::ShaderError> {
+        super::TEST_HOST_WAVE.set(Some(64));
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 256,
+            layout: Vec::new(),
+            used: Vec::new(),
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 1 << 15 | 2 << 1,
+                threads,
+            }),
+            code,
+        };
+        let p = ir::build(&native.code, true, 256).unwrap();
+        let st = structure::structure(&p).unwrap();
+        let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
+        let io = io::raise(&p, &native).unwrap();
+        let r = lower(&Parts {
+            native: &native,
+            p: &p,
+            st: &st,
+            io: &io,
+            res: &res,
+            inputs: vec![],
+            outputs: vec![],
+            prims: vec![],
+            mesh_stride: 0,
+        });
+        super::TEST_HOST_WAVE.set(None);
+        r
+    }
+
+    /// The console's `WaveActiveSum` of 16-bit floats (the tree of
+    /// `wave::tests::a_sum_of_halves_over_the_wave_is_followed_in_the_order_of_its_tree`)
+    /// inside a branch only lanes 0-31 take, in one host wave of 64: the
+    /// section turns every lane on (`s_or_saveexec_b64 -1`) and gives the
+    /// lanes outside the branch +0 (`v_cndmask`), which the host, whose
+    /// lanes outside the branch do not run, takes as +0 too. Refused before
+    /// ("where not every lane runs"): compute `b22a16a178976e1b` of the
+    /// title, dropped 28-42 times a frame in the world on AMD.
+    #[test]
+    fn a_wave_sum_of_halves_where_not_every_lane_runs_lowers_on_64_lane_hosts() {
+        let words = [
+            0x7D88_00A0, // v_cmp_gt_u32_e32 vcc, 32, v0
+            0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+            0xBF88_0014, // s_cbranch_execz 20 (past the section)
+            0xBE84_25C1, // s_or_saveexec_b64 s[4:5], -1
+            0xD501_0001,
+            0x0012_0E80, // v_cndmask_b32 v1, 0, v7, s[4:5]
+            0x6402_02E9,
+            0xDE54_C101, // v_add_f16 v1, v1, v1 dpp8:[1,0,3,2,5,4,7,6]
+            0x6402_02E9,
+            0x9360_1201, // v_add_f16 v1, v1, v1 dpp8:[2,2,0,0,6,6,4,4]
+            0x6402_02E9,
+            0x0009_2401, // v_add_f16 v1, v1, v1 dpp8:[4,4,4,4,0,0,0,0]
+            0x6402_02FA,
+            0xFF09_4001, // v_add_f16 v1, v1, v1 row_mirror bound_ctrl:1
+            0xD778_0002,
+            0x0201_0101, // v_permlanex16_b32 v2, v1, 0, 0
+            0x6402_0302, // v_add_f16 v1, v2, v1
+            0xD760_0007,
+            0x0001_4101, // v_readlane_b32 s7, v1, 32
+            0x6402_0207, // v_add_f16 v1, s7, v1
+            0xD760_0007,
+            0x0001_0101, // v_readlane_b32 s7, v1, 0
+            0xBEFE_0404, // s_mov_b64 exec, s[4:5]
+            0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+            0x7E06_0207, // v_mov_b32 v3, s7
+            0xD834_0000,
+            0x0000_0300, // ds_write_b32 v0, v3
+            S_ENDPGM,
+        ];
+        lower_wave64_host(&words, [64, 1, 1]).unwrap();
+    }
+
+    /// A scalar buffer load through a descriptor the program picks from the
+    /// view heap at an index it computes (heap base at s0, byte offset from a
+    /// root constant at s1): no used-resource entry, so the host's strides
+    /// table says what the slot holds and the load reads it as raw bytes, as
+    /// a constant buffer or as zeros.
+    #[test]
+    fn a_scalar_load_through_a_heap_picked_descriptor_lowers() {
+        let words = [
+            0x8F02_8501, // s_lshl_b32 s2, s1, 5 (slot index * 32 bytes)
+            0x8004_0200, // s_add_u32 s4, s0, s2
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::ResourceHeap, 0, 0), root(RootType::Constants, 1, 1)];
+        let lowered = lower_with(&words, layout, Vec::new()).unwrap();
+        assert!(
+            lowered.root_srvs.contains(&super::super::shader::SLOT_STRIDES),
+            "it reads the host's strides table"
         );
     }
 

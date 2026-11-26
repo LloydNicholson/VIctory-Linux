@@ -103,6 +103,8 @@ pub mod validator;
 #[cfg(all(test, windows))]
 mod probe_tests;
 #[cfg(all(test, windows))]
+mod heap_half_tests;
+#[cfg(all(test, windows))]
 mod size_tests;
 #[cfg(all(test, windows))]
 mod valu_tests;
@@ -121,7 +123,7 @@ pub use sampler::StaticSampler;
 pub use lower::{host_settings, set_host_max_wave, set_host_rdna};
 pub use rect::rect_list_gs;
 pub use shader::{
-    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+    MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_CONSTANT_BUFFER, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
     SLOT_STRIDES_COUNT, USER_DATA_SPACE, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS, USER_DISPATCH_THREADS_X, USER_MEMORY_BASE, USER_ROOT_ADDRESS, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
     raw_views, set_raw_views, set_view_heap_limit, view_heap_limit,
 };
@@ -182,6 +184,23 @@ pub fn group_sync() -> u8 {
         Some("1") => 1,
         _ => 2,
     })
+}
+
+/// Whether 16-bit halves moved through views of tables keep their bits
+/// (`VICTORY_HALF_VIEWS=1`; off by default). The face network
+/// (`compute_graph_ops`, then `ped_standard_head_cs`) keeps its halves in
+/// 16-bit unsigned views; read as floats there every value was 0 and no
+/// mouth moved. With this on under vkd3d-proton on RADV the mouths move,
+/// but the main characters' faces come out torn and shiny (the network
+/// still computes wrong values there; cause not found), so the still faces
+/// stay the default. Part of the translation: the shader cache keys on it.
+pub fn half_views_on() -> bool {
+    // (The tests check the translation with it.)
+    if cfg!(test) {
+        return true;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_VIEWS").is_some_and(|v| v == "1"))
 }
 
 /// Whether buffer atomics of the ray-tracing structure builder stand between
@@ -354,6 +373,21 @@ pub struct HostShader {
     pub root_uavs: Vec<u8>,
     /// Heap descriptors that can be selected from root state at bind time.
     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
+    /// Table descriptors (root parameter, dword offset in the table) whose
+    /// buffer the shader reads or writes sixteen bits a channel
+    /// (`buffer_load_format_d16_*`, `buffer_store_format_d16_*`), in
+    /// order. On the console each channel's 16 bits move as they are
+    /// through a 16-bit float view and through a 16-bit integer one alike
+    /// (the title keeps half floats, and indices beside them, in
+    /// `R16G16B16A16_UINT` and `R16_UINT` buffers). The DXIL moves them as
+    /// unsigned integers, which an unsigned 16-bit view carries unchanged;
+    /// the host shows the shader a 16-bit float or signed buffer view at
+    /// these places as the unsigned format of the same layout.
+    /// shortcut: a view in a normalised 16-bit format, whose values the
+    /// console would convert to halves, is read as its integers; a
+    /// descriptor picked at run time keeps the float path (its slot, and so
+    /// its format, is known only then).
+    pub half_views: Vec<(u8, u32)>,
 }
 
 impl HostShader {
@@ -796,6 +830,7 @@ fn emit_program(
         root_srvs: l.root_srvs,
         root_uavs: l.root_uavs,
         root_indexed_views: res.root_indexed_views.clone(),
+        half_views: l.half_views,
     };
     Ok((shader, wave_size))
 }
@@ -1578,6 +1613,7 @@ mod tests {
             root_srvs: Vec::new(),
             root_uavs: Vec::new(),
             root_indexed_views: Vec::new(),
+            half_views: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -1590,6 +1626,7 @@ mod tests {
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
                 root_indexed_views: Vec::new(),
+                half_views: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
@@ -2190,6 +2227,7 @@ mod tests {
             return;
         };
         let cs = super::HostShader {
+            half_views: Vec::new(),
             stage: super::HwStage::Cs,
             dxil,
             user_data: l.user_data,
@@ -2352,6 +2390,7 @@ mod tests {
                 root_srvs: l.root_srvs,
                 root_uavs: l.root_uavs,
                 root_indexed_views: Vec::new(),
+                half_views: l.half_views,
             };
             let (root, pso) = host.compute_pipeline(&cs).unwrap();
             let inputs: Vec<u32> = [
@@ -2759,6 +2798,7 @@ mod barycentric_tests {
         }
         s.m.terminate(s.entry, Term::Ret);
         let vs = HostShader {
+            half_views: Vec::new(),
             stage: HwStage::Vs,
             dxil: s.finish(),
             user_data: Vec::new(),
