@@ -22,7 +22,7 @@
 //! 18e57db8 found the same).
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -43,6 +43,11 @@ pub(crate) struct Pending {
     used: AtomicBool,
     /// A pass over the screen ([`GraphicsState::screen_pass`]).
     screen: bool,
+    /// When a worker began making it ([`since_start_us`] plus one; 0: not
+    /// begun), and whether a worker was started in place of the one that
+    /// is making it ([`stuck`]).
+    begun_us: AtomicU64,
+    replaced: AtomicBool,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -58,7 +63,13 @@ impl Pending {
             key.update(s.stage.as_bytes());
             key.update(s.hash.as_bytes());
         }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        key.update(
+            graphics
+                .as_ref()
+                .map(|g| g.describe())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         Pending {
             screen: graphics.as_ref().is_some_and(|g| g.screen_pass()),
             shaders,
@@ -68,6 +79,8 @@ impl Pending {
             made: OnceLock::new(),
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
+            begun_us: AtomicU64::new(0),
+            replaced: AtomicBool::new(false),
         }
     }
 
@@ -76,6 +89,12 @@ impl Pending {
     }
 
     fn make(&self) {
+        let _ = self.begun_us.compare_exchange(
+            0,
+            since_start_us() + 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
         self.made.get_or_init(|| {
             let began = Instant::now();
             let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
@@ -94,7 +113,13 @@ impl Pending {
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        // Its shaders: a worker that died making it (a stack overflow) leaves
+        // it here for good, and the frame line names it.
+        None if stuck(p) => Some(format!(
+            "stuck, its compile never came back {:?}",
+            p.shaders
+        )),
+        None => Some(format!("being made {:?}", p.shaders)),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -117,6 +142,67 @@ pub(crate) fn hashes(p: &Pending) -> String {
     hashes.join("+")
 }
 
+/// Microseconds since the first call (the clock of [`Pending::begun_us`]).
+fn since_start_us() -> u64 {
+    static START: OnceLock<Instant> = OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
+/// How long a pipeline may be in the making before it counts as stuck
+/// (`VICTORY_PIPELINE_STUCK_S`, 15 s by default; the slowest driver
+/// compiles seen took 3.4 s).
+fn stuck_after() -> Duration {
+    #[cfg(test)]
+    return Duration::from_millis(50);
+    #[cfg(not(test))]
+    {
+        static AFTER: OnceLock<Duration> = OnceLock::new();
+        *AFTER.get_or_init(|| {
+            Duration::from_secs(
+                std::env::var("VICTORY_PIPELINE_STUCK_S")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(15),
+            )
+        })
+    }
+}
+
+/// Whether `p`'s worker began making it longer ago than [`stuck_after`]
+/// and has not come back. Under Proton, vkd3d-proton's DXIL to SPIR-V
+/// conversion (dxil-spirv) recursed without end on three of the title's
+/// ray-traced shadow programs (dxil-spirv#376): the worker's stack
+/// overflowed whatever its size (2 GB tried), the thread was gone, and the
+/// pipeline stayed "being made": every frame then spent its whole wait
+/// budget on it (500 ms), and each such pipeline took a worker with it.
+/// The first time one is found stuck, it is said in the log and a worker
+/// is started in place of its own.
+fn stuck(p: &Pending) -> bool {
+    let begun = p.begun_us.load(Ordering::Relaxed);
+    if begun == 0 || p.made.get().is_some() {
+        return false;
+    }
+    let after = stuck_after().as_micros() as u64;
+    if since_start_us().saturating_sub(begun - 1) < after {
+        return false;
+    }
+    if !p.replaced.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            shaders = ?p.shaders,
+            seconds = stuck_after().as_secs(),
+            "a host pipeline's compile has not come back: it is not waited for any more, and a pipeline worker is started in place of the one making it"
+        );
+        STUCK.fetch_add(1, Ordering::Relaxed);
+        if WORKERS_STARTED.load(Ordering::Relaxed) > 0 {
+            spawn_worker(false);
+        }
+    }
+    true
+}
+
+/// Pipelines found [`stuck`] since the start.
+static STUCK: AtomicU64 = AtomicU64::new(0);
+
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
@@ -138,7 +224,10 @@ fn wait_budget() -> Duration {
 fn screen_budget() -> Duration {
     static BUDGET: OnceLock<Duration> = OnceLock::new();
     *BUDGET.get_or_init(|| {
-        let millis = std::env::var("VICTORY_SCREEN_WAIT_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000);
+        let millis = std::env::var("VICTORY_SCREEN_WAIT_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(10_000);
         Duration::from_millis(millis)
     })
 }
@@ -153,7 +242,10 @@ static WAITING: AtomicU64 = AtomicU64::new(0);
 
 /// Pipelines queued and not made yet (for the frame line).
 pub(crate) fn waiting() -> u64 {
-    WAITING.load(Ordering::Relaxed)
+    // Not the stuck ones: they are not being made any more.
+    WAITING
+        .load(Ordering::Relaxed)
+        .saturating_sub(STUCK.load(Ordering::Relaxed))
 }
 
 /// The host pipeline if it is made (or is made within the frame's budget);
@@ -174,6 +266,11 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
+    // Its worker never came back: making it here would wait for that
+    // worker for good (the one-time initialiser is still its).
+    if stuck(p) {
+        return false;
+    }
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
 }
@@ -203,13 +300,18 @@ fn shared_budget() -> bool {
 /// Waits for `p` while frame `frame` has budget left.
 fn wait(p: &Pending, frame: u64) {
     let screen = p.screen && screens_first();
-    let budget = if screen { screen_budget() } else { wait_budget() };
-    if budget.is_zero() {
+    let budget = if screen {
+        screen_budget()
+    } else {
+        wait_budget()
+    };
+    if budget.is_zero() || stuck(p) {
         return;
     }
     // The frame the budget belongs to, and what was waited of it (or is
     // taken by a thread waiting now); of the passes over the screen too.
-    static SPENT: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
+    static SPENT: [Mutex<(u64, Duration)>; 2] =
+        [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
     let spent_of = &SPENT[usize::from(screen)];
     let shared = shared_budget();
     let left = {
@@ -234,7 +336,10 @@ fn wait(p: &Pending, frame: u64) {
         if rest.is_zero() {
             break;
         }
-        held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+        held = done
+            .wait_timeout(held, rest)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
     }
     drop(held);
     let waited = started.elapsed().min(left);
@@ -283,7 +388,11 @@ fn slow_limit() -> usize {
         if std::env::var_os("VICTORY_PIPELINE_SLOW").is_some_and(|v| v == "0") {
             usize::MAX
         } else {
-            (worker_count(None, std::thread::available_parallelism().map_or(2, |n| n.get())) / 4).max(1)
+            (worker_count(
+                None,
+                std::thread::available_parallelism().map_or(2, |n| n.get()),
+            ) / 4)
+                .max(1)
         }
     })
 }
@@ -314,7 +423,11 @@ impl Queue {
     /// Queues an unrequested pipeline or promotes one queued at creation.
     /// Returns whether it is new to the queue, or `None` if nothing changed.
     fn push(&mut self, p: &Arc<Pending>, priority: u8) -> Option<bool> {
-        self.push_as(p, priority, slow_limit() != usize::MAX && super::library::slow(&p.key))
+        self.push_as(
+            p,
+            priority,
+            slow_limit() != usize::MAX && super::library::slow(&p.key),
+        )
     }
 
     fn push_as(&mut self, p: &Arc<Pending>, priority: u8, slow: bool) -> Option<bool> {
@@ -338,11 +451,15 @@ impl Queue {
     fn pop(&mut self, screens_only: bool, slow_limit: usize) -> Option<Arc<Pending>> {
         // An early entry can have been promoted and claimed already.
         let unclaimed = |list: &mut VecDeque<Arc<Pending>>| {
-            std::iter::from_fn(|| list.pop_front()).find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
+            std::iter::from_fn(|| list.pop_front())
+                .find(|p| p.queue_state.load(Ordering::Relaxed) == EARLY)
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self.requested.pop_front().or_else(|| unclaimed(&mut self.early));
+            p = self
+                .requested
+                .pop_front()
+                .or_else(|| unclaimed(&mut self.early));
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -375,7 +492,10 @@ fn start(p: &Arc<Pending>, priority: u8) {
     let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(new) = queue.push(p, priority) {
         if new {
-            PEAK.fetch_max(WAITING.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
+            PEAK.fetch_max(
+                WAITING.fetch_add(1, Ordering::Relaxed) + 1,
+                Ordering::Relaxed,
+            );
         }
         // (One woken could be a worker that takes passes over the screen
         // alone: it would leave the pipeline to nobody.)
@@ -395,6 +515,10 @@ fn next(screens_only: bool) -> Arc<Pending> {
         queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
     }
 }
+
+/// Stack of each pipeline worker: room for the driver's shader compiler,
+/// which runs on it (reserved address space; committed only as used).
+const PIPELINE_STACK: usize = 64 << 20;
 
 /// How many workers make pipelines: `asked` (`VICTORY_PIPELINE_WORKERS`, 1 to
 /// 64), else two thirds of the logical processors, 2 to 16. They run below the
@@ -420,43 +544,59 @@ fn workers() -> bool {
         tracing::info!(workers, "pipeline workers");
         let screens = if screens_first() { SCREEN_WORKERS } else { 0 };
         for i in 0..workers + screens {
-            let screens_only = i >= workers;
-            let spawned = std::thread::Builder::new()
-                .name(format!("victory-pipelines-{i}"))
-                .spawn(move || {
-                    // Below the title's own threads (loading, recording),
-                    // and the streaming one, which is below normal itself
-                    // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
-                    let lowest = !screens_only && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
-                    // SAFETY: a plain call on our own thread.
-                    unsafe {
-                        use windows::Win32::System::Threading::*;
-                        let priority = if lowest { THREAD_PRIORITY_LOWEST } else { THREAD_PRIORITY_BELOW_NORMAL };
-                        let _ = SetThreadPriority(GetCurrentThread(), priority);
-                    }
-                    loop {
-                        let p = next(screens_only);
-                        p.make();
-                        if p.was_slow.load(Ordering::Relaxed) {
-                            let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-                            queue.slow_now -= 1;
-                            AVAILABLE.notify_all();
-                        }
-                        if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
-                            drained();
-                        } else {
-                            super::library::save(false);
-                        }
-                    }
-                });
-            if let Err(e) = spawned {
-                tracing::warn!(error = %e, "no pipeline worker");
-            } else {
-                running = true;
-            }
+            running |= spawn_worker(i >= workers);
         }
         running
     })
+}
+
+/// Workers started since the start (each named by its number).
+static WORKERS_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Starts one more pipeline worker; whether it started.
+fn spawn_worker(screens_only: bool) -> bool {
+    let i = WORKERS_STARTED.fetch_add(1, Ordering::Relaxed);
+    let spawned = std::thread::Builder::new()
+        .name(format!("victory-pipelines-{i}"))
+        // The driver compiles pipelines on this thread, recursively:
+        // NVIDIA's compiler overflowed the default 2 MB on a world
+        // compute program and refused it as out of memory.
+        .stack_size(PIPELINE_STACK)
+        .spawn(move || {
+            // Below the title's own threads (loading, recording),
+            // and the streaming one, which is below normal itself
+            // (`VICTORY_PIPELINE_LOWEST=0`: level with it, as before).
+            let lowest = !screens_only
+                && std::env::var_os("VICTORY_PIPELINE_LOWEST").is_none_or(|v| v != "0");
+            // SAFETY: a plain call on our own thread.
+            unsafe {
+                use windows::Win32::System::Threading::*;
+                let priority = if lowest {
+                    THREAD_PRIORITY_LOWEST
+                } else {
+                    THREAD_PRIORITY_BELOW_NORMAL
+                };
+                let _ = SetThreadPriority(GetCurrentThread(), priority);
+            }
+            loop {
+                let p = next(screens_only);
+                p.make();
+                if p.was_slow.load(Ordering::Relaxed) {
+                    let mut queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+                    queue.slow_now -= 1;
+                    AVAILABLE.notify_all();
+                }
+                if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
+                    drained();
+                } else {
+                    super::library::save(false);
+                }
+            }
+        });
+    if let Err(e) = &spawned {
+        tracing::warn!(error = %e, "no pipeline worker");
+    }
+    spawned.is_ok()
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -502,6 +642,34 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    /// A pipeline whose worker never came back is not waited for, `now`
+    /// does not block on it, and a worker is started in its worker's place.
+    #[test]
+    fn a_stuck_pipeline_is_not_waited_for_and_its_worker_is_replaced() {
+        assert!(workers());
+        let p = Pending::new(Vec::new(), None);
+        // A worker began it and never returned (the one-time initialiser
+        // is never run here).
+        p.queue_state.store(MAKING, Ordering::Relaxed);
+        p.begun_us.store(since_start_us() + 1, Ordering::Relaxed);
+        let p = Arc::new(p);
+        assert!(!stuck(&p));
+        std::thread::sleep(stuck_after() + Duration::from_millis(20));
+        let before = WORKERS_STARTED.load(Ordering::Relaxed);
+        let started = Instant::now();
+        assert!(ready(&p).is_none());
+        assert!(!now(&p));
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "waited for a stuck pipeline"
+        );
+        assert_eq!(WORKERS_STARTED.load(Ordering::Relaxed), before + 1);
+        // Once only.
+        assert!(stuck(&p));
+        assert_eq!(WORKERS_STARTED.load(Ordering::Relaxed), before + 1);
+        assert!(p.made.get().is_none());
     }
 
     #[test]
