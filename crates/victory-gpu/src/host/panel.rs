@@ -24,7 +24,7 @@ use super::{Host, HostList};
 const EVERY: Duration = Duration::from_millis(500);
 
 /// Characters in a line, and lines.
-const LAYOUT: Layout = Layout { columns: 40, lines: 9 };
+const LAYOUT: Layout = Layout { columns: 40, lines: 9, bar: 0 };
 
 fn asked() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();

@@ -8760,11 +8760,16 @@ struct Presenter {
     panel: panel::Panel,
 }
 
-/// Characters in a line of the loading bar's box, and lines.
-const LOADING: dots::Layout = dots::Layout { columns: 64, lines: 5 };
+/// The loading bar's box: one line ("preparing shaders" and how far) over
+/// a bar three dots high.
+const LOADING: dots::Layout = dots::Layout {
+    columns: crate::pipeline::LOADING_COLUMNS as u32,
+    lines: 1,
+    bar: 3,
+};
 
 /// Pixels to a dot of the loading bar's box for a picture that high: three
-/// on a 1080-line picture, the box 1,170 by 153 pixels.
+/// on a 1080-line picture, the box 450 by 54 pixels.
 fn loading_scale(height: u32) -> u32 {
     (height / 360).max(1)
 }
@@ -9203,7 +9208,7 @@ impl Host {
                 let (overlay, asked) = &mut p.loading;
                 if asked.elapsed() >= std::time::Duration::from_millis(250) {
                     *asked = std::time::Instant::now();
-                    overlay.set(crate::pipeline::loading_lines());
+                    overlay.set_bar(crate::pipeline::loading());
                 }
                 #[cfg(feature = "diagnostics")]
                 let _ours = crate::replay::record::unrecorded();

@@ -13,9 +13,9 @@
 //! the workers and two more (cores less two in all), through the pipeline
 //! library, so that the world finds every one in it.
 //!
-//! A box on the picture (`crate::host::dots`) shows how far it is, how long
-//! is left, and that pressing A now starts the game but that it then runs
-//! slowly until this is done. Nothing holds A back.
+//! A small box on the picture (`crate::host::dots`) says "preparing
+//! shaders" with how far it is, over a thin bar. Nothing holds A back: the
+//! game starts at once, slowly until the bar is full.
 //!
 //! What is done is written down by key for the translator, settings and
 //! driver it was made with (`known::fingerprint`, in `warm-done.txt`, as
@@ -47,7 +47,7 @@ const JOURNAL_FILE: &str = "prepare-journal.txt";
 /// What a pipeline not known to take long is taken to take, in ms, for the
 /// time left.
 const PLAIN_MS: f64 = 300.0;
-/// How long the box says "ready" after the last one: long enough to read,
+/// How long the box stays full after the last one: long enough to see,
 /// short enough not to sit on the title's own screens.
 const READY_FOR: Duration = Duration::from_secs(2);
 
@@ -65,11 +65,6 @@ pub(crate) struct Progress {
     /// Expected ms of all, and of those done.
     pub(crate) weight: f64,
     pub(crate) done_weight: f64,
-    /// Being made now, and of them those known to take long.
-    pub(crate) running: usize,
-    pub(crate) running_long: usize,
-    pub(crate) workers: usize,
-    pub(crate) began: Instant,
     pub(crate) finished: Option<Instant>,
 }
 
@@ -79,69 +74,39 @@ fn progress() -> std::sync::MutexGuard<'static, Option<Progress>> {
     PROGRESS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Seconds as `42 S` or `3 MIN`.
-fn duration(s: f64) -> String {
-    match s.round() as u64 {
-        s @ 0..90 => format!("{s} S"),
-        s => format!("{} MIN", s.div_ceil(60)),
-    }
-}
+/// Characters in the box's line: the words on the left, the share on the right.
+pub(crate) const COLUMNS: usize = 24;
 
 impl Progress {
-    /// Seconds left: from the rate so far once there is one to go by, else
-    /// from what each is expected to take over the workers.
-    pub(crate) fn left(&self, elapsed: f64) -> f64 {
-        let rest = (self.weight - self.done_weight).max(0.0);
-        if elapsed >= 10.0 && self.done_weight > 0.0 {
-            rest * elapsed / self.done_weight
-        } else {
-            rest / 1e3 / self.workers.max(1) as f64
-        }
-    }
-
-    /// The lines of the box (five, of at most 64 characters).
-    pub(crate) fn lines(&self, now: Instant) -> Vec<String> {
-        if let Some(finished) = self.finished {
-            if now.saturating_duration_since(finished) >= READY_FOR {
-                return Vec::new();
-            }
-            let took = finished.saturating_duration_since(self.began).as_secs_f64();
-            let mut ready = format!("READY: {} PIPELINES MADE IN {}", self.done - self.stuck, duration(took));
-            if self.stuck > 0 {
-                ready += &format!(", {} LEFT TO THE GAME", self.stuck);
-            }
-            return vec![String::new(), ready, String::new(), "THE GAME RUNS AT FULL SPEED NOW.".into(), String::new()];
-        }
-        const CELLS: usize = 56;
-        // By expected time, as the time left: the long ones go first, and a
-        // count of them crawls through those and then leaps.
-        let share = if self.weight > 0.0 {
+    /// How full the bar is: by the expected time of what is done, not by
+    /// the count (the long ones go first, and a count crawls through those
+    /// and then leaps).
+    pub(crate) fn share(&self) -> f64 {
+        if self.weight > 0.0 {
             (self.done_weight / self.weight).clamp(0.0, 1.0)
         } else if self.total == 0 {
             1.0
         } else {
             self.done as f64 / self.total as f64
-        };
-        let filled = ((share * CELLS as f64) as usize).min(CELLS);
-        let bar = format!("[{}{}] {:>3}%", "=".repeat(filled), " ".repeat(CELLS - filled), (share * 100.0) as u32);
-        let elapsed = now.saturating_duration_since(self.began).as_secs_f64();
-        let mut count = format!("{} OF {}, ABOUT {} LEFT", self.done, self.total, duration(self.left(elapsed)));
-        if self.running_long > 0 {
-            count += &format!(", {} LONG ONES RUNNING", self.running_long);
         }
-        vec![
-            "PREPARING SHADERS AND PIPELINES FOR THIS BUILD".into(),
-            bar,
-            count,
-            "PRESS A NOW AND THE GAME STARTS, BUT RUNS SLOWLY UNTIL".into(),
-            "THIS IS DONE. KEPT ON DISK: THE NEXT START SKIPS IT.".into(),
-        ]
+    }
+
+    /// What the box shows: its one line and how full the bar under it is;
+    /// full for a moment at the end, then nothing (no box).
+    pub(crate) fn shown(&self, now: Instant) -> Option<(String, f64)> {
+        let share = match self.finished {
+            Some(finished) if now.saturating_duration_since(finished) >= READY_FOR => return None,
+            Some(_) => 1.0,
+            None => self.share(),
+        };
+        let percent = format!("{}%", (share * 100.0) as u32);
+        Some((format!("{:<w$}{percent:>4}", "PREPARING SHADERS", w = COLUMNS - 4), share))
     }
 }
 
-/// The lines of the loading box now (none: no box).
-pub(crate) fn lines() -> Vec<String> {
-    progress().as_ref().map(|p| p.lines(Instant::now())).unwrap_or_default()
+/// What the loading box shows now (none: no box).
+pub(crate) fn shown() -> Option<(String, f64)> {
+    progress().as_ref().and_then(|p| p.shown(Instant::now()))
 }
 
 /// The title created a pipeline: the first time, the pipelines to make are
@@ -279,10 +244,6 @@ fn run(dir: &Path) {
         stuck: 0,
         weight: work.iter().map(|w| weight_of(w.2)).sum(),
         done_weight: 0.0,
-        running: 0,
-        running_long: 0,
-        workers: cores.saturating_sub(2).max(1),
-        began,
         finished: None,
     });
     make::set_preparing(true);
@@ -296,7 +257,7 @@ fn run(dir: &Path) {
     while !open.is_empty() {
         std::thread::sleep(Duration::from_millis(250));
         let (mut done_lines, mut stuck_lines) = (Vec::new(), Vec::new());
-        let (mut running, mut running_long, mut weight_now) = (0, 0, 0.0);
+        let mut weight_now = 0.0;
         let mut in_flight = Vec::new();
         open.retain(|&i| {
             let (key, p, ms) = &work[i];
@@ -315,8 +276,6 @@ fn run(dir: &Path) {
                         false
                     }
                     Some(_) => {
-                        running += 1;
-                        running_long += usize::from(ms.is_some());
                         in_flight.push(i);
                         true
                     }
@@ -337,8 +296,6 @@ fn run(dir: &Path) {
             p.done += done_lines.len() + stuck_lines.len();
             p.stuck += stuck_lines.len();
             p.done_weight += weight_now;
-            (p.running, p.running_long) = (running, running_long);
-            p.workers = make::worker_total().max(1);
         }
     }
     let _ = std::fs::remove_file(path(JOURNAL_FILE));
@@ -397,13 +354,11 @@ mod tests {
         assert!(keys_in(&dir.path().join("none"), None).is_empty());
     }
 
-    /// The box: the bar fills with the expected time of what is done (not
-    /// the count: the long ones go first, and a count crawls through them and
-    /// then leaps), the time left comes from the expected times, then from
-    /// the rate; every line fits; "ready" for two seconds at the end, then no
-    /// box.
+    /// The box: one line, the words on the left and the share on the
+    /// right, over a bar filled with the expected time of what is done (not
+    /// the count); full for two seconds at the end, then no box.
     #[test]
-    fn the_box_shows_how_far_and_then_ready() {
+    fn the_box_shows_how_far_and_then_goes() {
         let began = Instant::now();
         let mut p = Progress {
             total: 200,
@@ -411,39 +366,17 @@ mod tests {
             stuck: 0,
             weight: 120_000.0,
             done_weight: 30_000.0,
-            running: 10,
-            running_long: 3,
-            workers: 10,
-            began,
             finished: None,
         };
-        // No rate yet: 90 s of work over 10 workers.
-        assert_eq!(p.left(5.0), 9.0);
-        // 30 s of it in 20 s: 90 s more takes 60 s.
-        assert_eq!(p.left(20.0), 60.0);
-        let lines = p.lines(began + Duration::from_secs(20));
-        assert_eq!(lines.len(), 5);
-        assert!(lines.iter().all(|l| l.len() <= 64), "{lines:?}");
-        assert!(lines[1].starts_with(&format!("[{} ", "=".repeat(14))), "{}", lines[1]);
-        assert!(lines[1].ends_with(" 25%"), "{}", lines[1]);
+        let at = |s| began + Duration::from_secs(s);
+        assert_eq!(p.shown(at(20)), Some(("PREPARING SHADERS    25%".to_owned(), 0.25)));
         // A quarter of them, but half the expected time: half full.
-        let half = Progress { done_weight: 60_000.0, ..p.clone() }.lines(began + Duration::from_secs(20));
-        assert!(half[1].starts_with(&format!("[{} ", "=".repeat(28))), "{}", half[1]);
-        assert!(half[1].ends_with(" 50%"), "{}", half[1]);
-        assert_eq!(lines[2], "50 OF 200, ABOUT 60 S LEFT, 3 LONG ONES RUNNING");
-        assert!(lines[3].contains("RUNS SLOWLY"));
-        (p.done, p.stuck, p.finished) = (200, 2, Some(began + Duration::from_secs(150)));
-        let ready = p.lines(began + Duration::from_secs(151));
-        assert_eq!(ready[1], "READY: 198 PIPELINES MADE IN 3 MIN, 2 LEFT TO THE GAME");
-        assert!(ready.iter().all(|l| l.len() <= 64));
-        assert!(p.lines(began + Duration::from_secs(152)).is_empty(), "ready for two seconds only");
+        let half = Progress { done_weight: 60_000.0, ..p.clone() }.shown(at(20)).unwrap();
+        assert_eq!(half, ("PREPARING SHADERS    50%".to_owned(), 0.5));
+        assert_eq!(half.0.len(), COLUMNS);
+        (p.done, p.done_weight, p.finished) = (200, 120_000.0, Some(at(150)));
+        assert_eq!(p.shown(at(151)), Some(("PREPARING SHADERS   100%".to_owned(), 1.0)));
+        assert_eq!(p.shown(at(152)), None, "full for two seconds only");
     }
 
-    #[test]
-    fn durations_read_in_seconds_then_minutes() {
-        assert_eq!(duration(42.4), "42 S");
-        assert_eq!(duration(89.0), "89 S");
-        assert_eq!(duration(95.0), "2 MIN");
-        assert_eq!(duration(600.0), "10 MIN");
-    }
 }

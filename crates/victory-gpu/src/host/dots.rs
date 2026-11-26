@@ -80,11 +80,13 @@ pub(super) const fn glyph(c: u8) -> [u8; 7] {
     }
 }
 
-/// How many characters a line of a box holds, and how many lines.
+/// How many characters a line of a box holds, how many lines, and how many
+/// rows of dots a bar under them takes (0: no bar).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Layout {
     pub(super) columns: u32,
     pub(super) lines: u32,
+    pub(super) bar: u32,
 }
 
 impl Layout {
@@ -92,15 +94,23 @@ impl Layout {
     pub(super) const fn size(self, scale: u32) -> (u32, u32) {
         (
             (self.columns * CELL.0 + 2 * RIM) * scale,
-            (self.lines * CELL.1 + 2 * RIM) * scale,
+            (self.lines * CELL.1 + self.bar + 2 * RIM) * scale,
         )
     }
 
-    /// Whether a dot of the picture of `lines` is white.
-    pub(super) fn lit(self, lines: &[String], x: u32, y: u32) -> bool {
+    /// Whether a dot of the picture of `lines` is white, the bar under them
+    /// `fill` full: whole rows of dots as far as it is filled, its middle
+    /// row past that.
+    pub(super) fn lit(self, lines: &[String], fill: f64, x: u32, y: u32) -> bool {
         let (Some(x), Some(y)) = (x.checked_sub(RIM), y.checked_sub(RIM)) else {
             return false;
         };
+        // The text's last column of dots is a gap; the bar ends where it does.
+        let across = self.columns * CELL.0 - 1;
+        if let Some(row) = y.checked_sub(self.lines * CELL.1).filter(|&r| r < self.bar) {
+            let filled = (fill.clamp(0.0, 1.0) * f64::from(across)).round() as u32;
+            return x < across && (x < filled || row == self.bar / 2);
+        }
         if x % CELL.0 >= GLYPH.0 || y % CELL.1 >= GLYPH.1 || x / CELL.0 >= self.columns {
             return false;
         }
@@ -111,14 +121,14 @@ impl Layout {
     }
 
     /// The box as rows of `pitch` bytes.
-    pub(super) fn painted(self, lines: &[String], scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
+    pub(super) fn painted(self, lines: &[String], fill: f64, scale: u32, colours: [&[u8]; 2], pitch: usize) -> Vec<u8> {
         let (width, height) = self.size(scale);
         let bytes = colours[0].len();
         let mut out = vec![0; pitch * height as usize];
         for y in 0..height / scale {
             let top = pitch * (y * scale) as usize;
             for x in 0..width / scale {
-                let colour = colours[usize::from(self.lit(lines, x, y))];
+                let colour = colours[usize::from(self.lit(lines, fill, x, y))];
                 for i in 0..scale {
                     let at = top + (x * scale + i) as usize * bytes;
                     out[at..at + bytes].copy_from_slice(colour);
@@ -212,9 +222,9 @@ impl Buffers {
         Some(Buffers { format, scale, pitch, uploads, card: card?, turn: 0, fresh: false })
     }
 
-    fn write(&mut self, layout: Layout, lines: &[String]) {
+    fn write(&mut self, layout: Layout, lines: &[String], fill: f64) {
         let Some(colours) = colours(self.format) else { return };
-        let picture = layout.painted(lines, self.scale, colours, self.pitch as usize);
+        let picture = layout.painted(lines, fill, self.scale, colours, self.pitch as usize);
         self.turn = (self.turn + 1) % UPLOADS;
         // SAFETY: a mapped upload buffer of the picture's size, which the card read some presents ago.
         unsafe { std::ptr::copy_nonoverlapping(picture.as_ptr(), self.uploads[self.turn].1, picture.len()) };
@@ -228,6 +238,8 @@ pub(super) struct Overlay {
     layout: Layout,
     place: Place,
     lines: Vec<String>,
+    /// How full the bar is (a layout with one).
+    fill: f64,
     changed: bool,
     buffers: Option<Buffers>,
     failed: bool,
@@ -235,7 +247,7 @@ pub(super) struct Overlay {
 
 impl Overlay {
     pub(super) fn new(layout: Layout, place: Place) -> Overlay {
-        Overlay { layout, place, lines: Vec::new(), changed: false, buffers: None, failed: false }
+        Overlay { layout, place, lines: Vec::new(), fill: 0.0, changed: false, buffers: None, failed: false }
     }
 
     /// The box shows `lines` from the next present on (none: no box).
@@ -244,6 +256,17 @@ impl Overlay {
             self.lines = lines;
             self.changed = true;
         }
+    }
+
+    /// The box shows `line` over its bar `fill` full (none: no box).
+    pub(super) fn set_bar(&mut self, shown: Option<(String, f64)>) {
+        let (lines, fill) = shown.map_or((Vec::new(), 0.0), |(line, fill)| (vec![line], fill));
+        // The bar is painted again only when it moves a dot or more at most scales.
+        if (fill - self.fill).abs() >= 0.002 || lines.is_empty() {
+            self.fill = fill;
+            self.changed = true;
+        }
+        self.set(lines);
     }
 
     /// Records the copy of the box onto `back`, a buffer of the swap chain of
@@ -270,7 +293,7 @@ impl Overlay {
         }
         let Some(buffers) = &mut self.buffers else { return };
         if std::mem::take(&mut self.changed) {
-            buffers.write(self.layout, &self.lines);
+            buffers.write(self.layout, &self.lines, self.fill);
         }
         let (w, h) = self.layout.size(scale);
         let (x, y) = corner(self.place, (w, h), (width, height));
@@ -323,7 +346,7 @@ impl Overlay {
 mod tests {
     use super::*;
 
-    const LAYOUT: Layout = Layout { columns: 40, lines: 9 };
+    const LAYOUT: Layout = Layout { columns: 40, lines: 9, bar: 0 };
 
     /// Every character the lines use has its own picture, and no two look
     /// alike.
@@ -346,7 +369,7 @@ mod tests {
             let (width, height) = LAYOUT.size(scale);
             let pitch = (width * 4).next_multiple_of(256) as usize;
             let colours = colours(DXGI_FORMAT_R10G10B10A2_UNORM).unwrap();
-            let picture = LAYOUT.painted(&lines, scale, colours, pitch);
+            let picture = LAYOUT.painted(&lines, 0.0, scale, colours, pitch);
             assert_eq!(picture.len(), pitch * height as usize);
             let at = |x: u32, y: u32| &picture[y as usize * pitch + x as usize * 4..][..4];
             // The rim is black, the first letter's top row lit in its middle.
@@ -359,6 +382,25 @@ mod tests {
             // Nothing past a line's end.
             assert_eq!(at((RIM + CELL.0 * 2 + 2) * scale, (RIM + CELL.1) * scale), colours[0]);
         }
+    }
+
+    /// A bar under the line: whole rows as far as it is filled, its middle
+    /// row past that, nothing past the text's width.
+    #[test]
+    fn a_bar_is_painted_under_the_line() {
+        let layout = Layout { columns: 10, lines: 1, bar: 3 };
+        let lines = ["X".to_owned()];
+        let (top, across) = (RIM + CELL.1, 10 * CELL.0 - 1);
+        let lit = |fill, x, y| layout.lit(&lines, fill, RIM + x, top + y);
+        assert_eq!(layout.size(1), (10 * CELL.0 + 2 * RIM, CELL.1 + 3 + 2 * RIM));
+        // Half full: all three rows to the middle, then the middle row only.
+        let half = across / 2;
+        assert!((0..3).all(|y| lit(0.5, 0, y) && lit(0.5, half, y)));
+        assert!(!lit(0.5, half + 1, 0) && lit(0.5, half + 1, 1) && !lit(0.5, half + 1, 2));
+        assert!(lit(0.0, across - 1, 1) && !lit(0.0, across, 1));
+        assert!((0..3).all(|y| lit(1.0, across - 1, y)));
+        // The text above it is as before.
+        assert!(layout.lit(&lines, 0.5, RIM, RIM) && !layout.lit(&lines, 0.5, RIM + 2, RIM));
     }
 
     /// The low box sits across the middle, above the bottom, and inside a

@@ -62,9 +62,10 @@ target\diag\victory.exe warm --used                     # pipelines earlier runs
 
 After a change of the translator or the driver, a run makes the pipelines
 earlier runs drew with while the title boots, from the pipelines kept of earlier
-runs (on by default; `VICTORY_PIPELINE_BOOK=0` keeps none): a loading bar on the
-title's first screens shows how far it is and how long is left. Pressing A
-starts the game at once, but it runs slowly until the bar is full. What is made
+runs (on by default; `VICTORY_PIPELINE_BOOK=0` keeps none): a small bar on the
+title's first screens ("preparing shaders" and a percentage) shows how far it
+is. Pressing A starts the game at once, but it runs slowly until the bar is
+full. What is made
 is kept on disk, and a start with nothing new shows no bar. `VICTORY_PREPARE=0`
 makes nothing at the start. Under Proton, set `VICTORY_HOST_STACK` to something
 that changes with Mesa and Proton (the launch script does), so that a driver

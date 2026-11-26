@@ -784,12 +784,17 @@ mod make;
 #[cfg(windows)]
 mod prepare;
 
-/// The lines of the loading bar's box of the pipelines made at the start
-/// (`prepare`): none when nothing is being made.
+/// What the loading bar's box of the pipelines made at the start
+/// (`prepare`) shows: its line and how full its bar is; none when nothing
+/// is being made.
 #[cfg(windows)]
-pub(crate) fn loading_lines() -> Vec<String> {
-    prepare::lines()
+pub(crate) fn loading() -> Option<(String, f64)> {
+    prepare::shown()
 }
+
+/// Characters in the loading bar's line.
+#[cfg(windows)]
+pub(crate) const LOADING_COLUMNS: usize = prepare::COLUMNS;
 
 /// Lets the pipeline library's mapped file go from memory when no pipeline
 /// has loaded for a while (`library::trim`); called by the host's sweep.
