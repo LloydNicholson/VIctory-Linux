@@ -3797,6 +3797,7 @@ fn late_line(frames: f64) {
 pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
+mod dots;
 pub(crate) mod indirects;
 #[cfg(feature = "diagnostics")]
 mod panel;
@@ -8752,8 +8753,20 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
+    /// The loading bar of the pipelines made at the start
+    /// (`crate::pipeline::prepare`), and when its text was last asked for.
+    loading: (dots::Overlay, std::time::Instant),
     #[cfg(feature = "diagnostics")]
     panel: panel::Panel,
+}
+
+/// Characters in a line of the loading bar's box, and lines.
+const LOADING: dots::Layout = dots::Layout { columns: 64, lines: 5 };
+
+/// Pixels to a dot of the loading bar's box for a picture that high: three
+/// on a 1080-line picture, the box 1,170 by 153 pixels.
+fn loading_scale(height: u32) -> u32 {
+    (height / 360).max(1)
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -9186,6 +9199,16 @@ impl Host {
             let watched = crate::popwatch::take(&self.device, list, texture);
             #[cfg(feature = "diagnostics")]
             p.panel.draw(self, copy, &back, (width, height), format);
+            {
+                let (overlay, asked) = &mut p.loading;
+                if asked.elapsed() >= std::time::Duration::from_millis(250) {
+                    *asked = std::time::Instant::now();
+                    overlay.set(crate::pipeline::loading_lines());
+                }
+                #[cfg(feature = "diagnostics")]
+                let _ours = crate::replay::record::unrecorded();
+                overlay.draw(self, copy, &back, (width, height), format, loading_scale(height));
+            }
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
@@ -9277,6 +9300,10 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
+                loading: (
+                    dots::Overlay::new(LOADING, dots::Place::LowMiddle),
+                    std::time::Instant::now() - std::time::Duration::from_secs(1),
+                ),
                 #[cfg(feature = "diagnostics")]
                 panel: panel::Panel::new(),
             })

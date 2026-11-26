@@ -21,9 +21,9 @@
 //! its end (run textures-d2, the first after a new translation; Belobug
 //! 18e57db8 found the same).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
 use super::Shader;
@@ -114,6 +114,69 @@ impl Pending {
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// Every pipeline alive, by key: the title's, their format variants and
+/// those made at the start (`super::prepare`). One made at the start is the
+/// one the title gets when it creates the same pipeline, and the reverse,
+/// so that neither makes it again beside the other.
+static ALIVE: Mutex<Option<HashMap<String, Weak<Pending>>>> = Mutex::new(None);
+
+/// The pipeline alive with `p`'s key, or `p` (kept as the one alive).
+pub(crate) fn shared(p: Pending) -> Arc<Pending> {
+    let mut alive = ALIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let alive = alive.get_or_insert_with(HashMap::new);
+    if let Some(there) = alive.get(&p.key).and_then(Weak::upgrade) {
+        return there;
+    }
+    let p = Arc::new(p);
+    alive.insert(p.key.clone(), Arc::downgrade(&p));
+    p
+}
+
+/// What came of `p`: `None` while it is not made, else whether it has a
+/// host pipeline.
+pub(super) fn outcome(p: &Pending) -> Option<bool> {
+    p.made.get().map(Option::is_some)
+}
+
+/// How long a worker has been making `p`, if one is and it is not made.
+pub(super) fn making_for(p: &Pending) -> Option<Duration> {
+    let begun = p.begun_us.load(Ordering::Relaxed);
+    if begun == 0 || p.made.get().is_some() {
+        return None;
+    }
+    Some(Duration::from_micros(since_start_us().saturating_sub(begun - 1)))
+}
+
+/// While pipelines are made at the start (`super::prepare`): those known to
+/// take long go first and are not held to a share of the workers, so that
+/// the longest are not what is left at the end.
+static PREPARING: AtomicBool = AtomicBool::new(false);
+
+pub(super) fn set_preparing(on: bool) {
+    PREPARING.store(on, Ordering::Relaxed);
+    let _held = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+    AVAILABLE.notify_all();
+}
+
+/// Queues `p`, made at the start (`super::prepare`), as one an earlier run
+/// drew with; with the first, workers are started up to `workers` in all.
+pub(super) fn warm(p: &Arc<Pending>, workers_wanted: usize) {
+    static ADDED: std::sync::Once = std::sync::Once::new();
+    if workers() {
+        ADDED.call_once(|| {
+            for _ in worker_total()..workers_wanted {
+                spawn_worker(false);
+            }
+        });
+    }
+    start(p, EARLY);
+}
+
+/// The workers there are besides those for passes over the screen.
+pub(super) fn worker_total() -> usize {
+    WORKERS_STARTED.load(Ordering::Relaxed).saturating_sub(if screens_first() { SCREEN_WORKERS } else { 0 })
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -316,7 +379,11 @@ fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) ->
                 so_far,
                 "a pipeline is made again for the render target formats bound at its draw (eight render targets, then depth; VICTORY_TARGET_VARIANTS=0: the draw goes out with the title's pipeline)"
             );
-            Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))))
+            // Kept in the book as the title's own are: the next start
+            // makes it before a draw asks for it (`super::prepare`).
+            let v = shared(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))));
+            super::known::note(v.key(), &v.shaders, v.graphics.as_deref());
+            v
         });
         // (A state made for `bound` declares exactly `bound`.)
         if next.formats == *bound {
@@ -520,10 +587,18 @@ impl Queue {
         };
         let mut p = self.screen.pop_front();
         if p.is_none() && !screens_only {
-            p = self
-                .requested
-                .pop_front()
-                .or_else(|| unclaimed(&mut self.early));
+            p = self.requested.pop_front();
+            // At the start the long ones first (`super::prepare`).
+            if p.is_none() && PREPARING.load(Ordering::Relaxed) {
+                p = unclaimed(&mut self.slow);
+                if let Some(p) = &p {
+                    p.was_slow.store(true, Ordering::Relaxed);
+                    self.slow_now += 1;
+                }
+            }
+            if p.is_none() {
+                p = unclaimed(&mut self.early);
+            }
             if p.is_none() && self.slow_now < slow_limit {
                 p = unclaimed(&mut self.slow);
                 if let Some(p) = &p {
@@ -758,6 +833,22 @@ mod tests {
         assert!(Arc::ptr_eq(second, variant(&p, g, &b)));
         assert_eq!(first.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
         assert_eq!(p.queue_state.load(Ordering::Relaxed), NOT_QUEUED);
+    }
+
+    /// The title's pipeline and one made at the start with the same key are
+    /// one: while either lives, the other is it.
+    #[test]
+    fn one_pending_per_key_while_it_lives() {
+        let declaring = |f| Pending::new(Vec::new(), Some(Box::new(GraphicsState::declaring(f))));
+        let a = shared(declaring(40));
+        let again = shared(declaring(40));
+        assert!(Arc::ptr_eq(&a, &again));
+        assert!(!Arc::ptr_eq(&a, &shared(declaring(41))));
+        let key = a.key.clone();
+        drop((a, again));
+        let fresh = shared(declaring(40));
+        assert_eq!(fresh.key, key);
+        assert_eq!(Arc::strong_count(&fresh), 1, "a new one, not the one let go");
     }
 
     #[test]

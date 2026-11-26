@@ -60,6 +60,16 @@ target\diag\victory.exe shaders <the shader archives>   # every shader translate
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
 ```
 
+After a change of the translator or the driver, a run makes the pipelines
+earlier runs drew with while the title boots, from the pipelines kept of earlier
+runs (on by default; `VICTORY_PIPELINE_BOOK=0` keeps none): a loading bar on the
+title's first screens shows how far it is and how long is left. Pressing A
+starts the game at once, but it runs slowly until the bar is full. What is made
+is kept on disk, and a start with nothing new shows no bar. `VICTORY_PREPARE=0`
+makes nothing at the start. Under Proton, set `VICTORY_HOST_STACK` to something
+that changes with Mesa and Proton (the launch script does), so that a driver
+update makes them again too.
+
 Commands, debugging switches and upstream's own description:
 [docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
 described in a comment where it is read.
