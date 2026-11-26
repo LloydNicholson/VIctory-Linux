@@ -159,7 +159,8 @@ pub(super) fn colours(format: DXGI_FORMAT) -> Option<[&'static [u8]; 2]> {
 /// Where a box goes on the picture.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Place {
-    /// The upper left corner.
+    /// The upper left corner (the diagnostics panel).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
     TopLeft,
     /// Across the middle, a twelfth of the picture above its bottom.
     LowMiddle,
