@@ -1201,6 +1201,51 @@ static PROTECTED: Bits = Bits::new();
 /// the bit reads the bytes after.
 static BESIDE: Bits = Bits::new();
 
+/// The blocks the runtime reserved as placeholders, as it told us
+/// ([`title_placeholder_reserved`]), for [`placeholder`] to know them by
+/// without asking (`VICTORY_TOLD_HOLES=1`; off: Windows is asked, as before).
+///
+/// Wine answers no question of class `MemoryRegionInformationEx`
+/// (`STATUS_INVALID_INFO_CLASS`), so under Proton no hole was ever known for a
+/// placeholder's, none was held, and every asking put a question to it for
+/// each hole again: some 21,700 a frame, under the guards' lock (boat
+/// checkpoint, 2026-11-26).
+static TOLD_PLACEHOLDERS: Bits = Bits::new();
+
+/// Whether placeholders are known by what the runtime told
+/// (`VICTORY_TOLD_HOLES=1`).
+fn told_holes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TOLD_HOLES").is_some_and(|v| v == "1"))
+}
+
+/// The runtime reserved `[at, at + len)` as a placeholder: pages come to be
+/// there only by mapping a view ([`title_memory_remapped`]) or an allocation
+/// ([`title_memory_allocated`]), both of which we are told of.
+pub fn title_placeholder_reserved(at: usize, len: usize) {
+    if len == 0 || !told_holes() {
+        return;
+    }
+    (at.div_ceil(BLOCK)..at.saturating_add(len) / BLOCK).for_each(|block| TOLD_PLACEHOLDERS.set(block));
+}
+
+/// `[at, at + len)` holds other memory than a placeholder now, or may soon:
+/// its blocks are no longer told placeholders. With `len` 0 (a whole
+/// allocation freed), the run of told blocks from `at`.
+fn untell_placeholders(at: usize, len: usize) {
+    if !told_holes() {
+        return;
+    }
+    if len == 0 {
+        let mut block = at / BLOCK;
+        while TOLD_PLACEHOLDERS.take(block) {
+            block += 1;
+        }
+        return;
+    }
+    (at / BLOCK..at.saturating_add(len).div_ceil(BLOCK)).for_each(|block| TOLD_PLACEHOLDERS.clear(block));
+}
+
 /// How much was put into a block beside its guard since it was last told as
 /// written (`crate::titlewrite::MOST`), by a few bits of its number.
 static PUT: [std::sync::atomic::AtomicU32; 1 << 13] = [const { std::sync::atomic::AtomicU32::new(0) }; 1 << 13];
@@ -1307,6 +1352,9 @@ fn known_holes() -> bool {
 /// to be only by mapping a view (or an allocation) in its place, which an
 /// ordinary commit cannot do.
 fn placeholder(block: usize) -> bool {
+    if told_holes() && TOLD_PLACEHOLDERS.any(block, block + 1) {
+        return true;
+    }
     /// `MEMORY_REGION_INFORMATION` (ntddk).
     #[repr(C)]
     #[derive(Default)]
@@ -1351,6 +1399,7 @@ fn placeholder(block: usize) -> bool {
 /// The runtime gave the title memory at `[at, at + len)`, allocated or
 /// committed: what was known of holes there is asked again.
 pub fn title_memory_allocated(at: usize, len: usize) {
+    untell_placeholders(at, len.max(1));
     if len == 0 || !known_holes() {
         return;
     }
@@ -2712,6 +2761,7 @@ pub fn title_memory_unmapping(at: usize, len: usize) {
 /// was noted of its blocks (guarded, clean, absent) would be taken for true
 /// of the next memory at the address.
 pub fn title_memory_freed(at: usize, len: usize) {
+    untell_placeholders(at, len);
     let mut g = guards();
     let first = at / BLOCK;
     let noted = [g.protected.range(first..).next(), g.absent.range(first..).next(), g.foreign.range(first..).next().copied()];
