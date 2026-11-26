@@ -1392,14 +1392,17 @@ pub(crate) fn probe_view_limit() {
             };
             made.is_ok()
         };
-        let twins = raw_twins() && fits(2 * RAW_TWINS);
+        // `VICTORY_VIEW_CAP=1`: heaps of PORTABLE_VIEWS and no raw twins even where the host takes more, as on a
+        // host that caps them (AMDVLK, NVIDIA): a frame recorded so replays on such a host too.
+        let cap = std::env::var_os("VICTORY_VIEW_CAP").is_some_and(|v| v == "1");
+        let twins = !cap && raw_twins() && fits(2 * RAW_TWINS);
         if twins {
             victory_shader::emit::set_raw_views(RAW_TWINS);
         }
         // (The twins lie past the null slot.)
         let views = if twins {
             RAW_TWINS
-        } else if fits(UNCAPPED_VIEWS) {
+        } else if !cap && fits(UNCAPPED_VIEWS) {
             UNCAPPED_VIEWS
         } else {
             PORTABLE_VIEWS
