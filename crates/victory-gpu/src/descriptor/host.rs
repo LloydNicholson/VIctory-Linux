@@ -1251,6 +1251,17 @@ pub(crate) static OBJECT_TEXTURE_SLOTS: std::sync::atomic::AtomicU64 = std::sync
 /// Bytes per element of a buffer view, as the console's descriptor holds
 /// them for indexed reads (structured: the stride; raw: 1, the index is the
 /// byte; typed: the format's); `None` if `view` is not a buffer view.
+/// The strides-table dword of a heap slot holding `view`
+/// (`victory_shader::emit::SLOT_STRIDES`): a buffer view's stride,
+/// `SLOT_CONSTANT_BUFFER` for a constant buffer view, 0 for anything else.
+fn slot_word(view: Option<&View>) -> u32 {
+    match view {
+        Some(View::Constant(..)) => victory_shader::emit::SLOT_CONSTANT_BUFFER,
+        Some(v) => view_stride(v).unwrap_or(0) | view_kind(v),
+        None => 0,
+    }
+}
+
 fn view_stride(view: &View) -> Option<u32> {
     let (stride, raw, format) = view_elements(view)?;
     Some(if stride > 0 {
@@ -2684,7 +2695,9 @@ impl HostHeap {
         {
             // SAFETY: inside the mapping; shaders read it while we write (a
             // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+            let word = slot_word(view);
+            debug_assert!(word == victory_shader::emit::SLOT_CONSTANT_BUFFER || word == stride.unwrap_or(0) | kind);
+            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
         }
         let was = if stride.is_some() {
             self.buffers.put(index);
@@ -4931,6 +4944,18 @@ mod tests {
         super::read_short(start);
         assert!(pending());
         super::read_all(start);
+    }
+
+    /// The strides table tells shaders a constant buffer from a slot with
+    /// nothing a buffer load can read (a texture, a sampler, nothing):
+    /// read as a constant buffer, those faulted the card at address 0.
+    #[test]
+    fn the_strides_table_marks_constant_buffers_and_zeroes_the_rest() {
+        use victory_shader::emit::SLOT_CONSTANT_BUFFER;
+        assert_eq!(slot_word(Some(&View::Constant(0x1000_0000, 256))), SLOT_CONSTANT_BUFFER);
+        assert_eq!(slot_word(None), 0, "an empty slot");
+        assert_eq!(slot_word(Some(&View::Sampler([0; 13]))), 0, "a sampler");
+        assert_eq!(slot_word(Some(&View::Shader(1, None))), 0, "a view with the resource's own (texture) description");
     }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's

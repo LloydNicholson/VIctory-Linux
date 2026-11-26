@@ -6160,16 +6160,24 @@ impl<'a> Lower<'a> {
         // BatchCullPreSkinnedMeshlets, BatchCullBatchCSMeshlets) reads its
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
-        // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // The host's table of strides by heap slot tells a buffer view (a
+        // stride), a constant buffer (`SLOT_CONSTANT_BUFFER`) and anything
+        // else (0) apart; only the load that fits the slot runs, and a slot
+        // that is neither reads zeros, as the console's hardware gives for
+        // a descriptor with no buffer behind it. (Read as a constant buffer,
+        // a texture's or an empty slot faulted the card at address 0 on the
+        // host's D3D12 on Linux: fork issue #698, item 4.)
         let picked = match kind {
             None => self.slot_stride(src)?,
             Some(_) => None,
         };
         if let Some(stride) = picked {
             let zero = self.s.m.i32(0);
-            let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
+            let constant = self.s.m.i32(super::shader::SLOT_CONSTANT_BUFFER);
+            let c = self.cur;
+            let some = self.s.m.cmp(c, pred::NE, stride, zero);
+            let not_cb = self.s.m.cmp(c, pred::NE, stride, constant);
+            let is_buffer = self.s.m.bin(c, Bin::And, some, not_cb);
             let at = self.begin_guarded(Some(is_buffer));
             let h = self.handle(site, src, false, (11, 0))?;
             let mut raw = Vec::new();
@@ -6197,7 +6205,7 @@ impl<'a> Lower<'a> {
                 raw.push((x, zero));
             }
             let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
+            let other = self.s.m.cmp(self.cur, pred::EQ, stride, constant);
             let at = self.begin_guarded(Some(other));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
@@ -13111,6 +13119,34 @@ mod tests {
             perm_features(256) & 0x8000,
             0,
             "dynamic v_perm_b32 must not require INT64"
+        );
+    }
+
+    /// A scalar buffer load through a descriptor the program picks from the
+    /// view heap at an index it computes (heap base at s0, byte offset from a
+    /// root constant at s1): no used-resource entry, so the host's strides
+    /// table says what the slot holds and the load reads it as raw bytes, as
+    /// a constant buffer or as zeros.
+    #[test]
+    fn a_scalar_load_through_a_heap_picked_descriptor_lowers() {
+        let words = [
+            0x8F02_8501, // s_lshl_b32 s2, s1, 5 (slot index * 32 bytes)
+            0x8004_0200, // s_add_u32 s4, s0, s2
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0202,
+            0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+            0xF420_0304,
+            0xFA00_0000, // s_buffer_load_dword s12, s[8:11], 0
+            0x7E02_020C, // v_mov_b32 v1, s12
+            0xD834_0000,
+            0x0000_0100, // ds_write_b32 v0, v1
+            S_ENDPGM,
+        ];
+        let layout = vec![root(RootType::ResourceHeap, 0, 0), root(RootType::Constants, 1, 1)];
+        let lowered = lower_with(&words, layout, Vec::new()).unwrap();
+        assert!(
+            lowered.root_srvs.contains(&super::super::shader::SLOT_STRIDES),
+            "it reads the host's strides table"
         );
     }
 
