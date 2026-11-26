@@ -24,8 +24,12 @@ SHOT_EVERY_MIN=3
 # but its menus' buttons come out oversized; VICTORY_RENDER_SCALE=0.5 alone keeps them but smears (the upscaler).
 # VICTORY_HALF_VIEWS=1 (mouths move) is left out: on the stock RADV the main characters' mouths come out distorted with
 # it (see DRIVER_JSON above for the fix).
+# VICTORY_SHOW_AFTER=0 (play.ps1 has 1): with 1 a texture new to its slot shows a 1x1 grey stand-in until its upload has
+# run, a frame or more, and trees lose their leaves for those frames where they come into view (the boat checkpoint's
+# mangroves: whole frames without leaves at the cut; 0: none, stand-ins 90117 -> 0, same fps). The device-loss guard
+# that matters, VICTORY_SHOW_NEW_LATER (on by default), stays.
 SWITCHES="VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 VICTORY_JOIN_COPIES=1
 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=1 VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1
-VICTORY_TITLE_PRIORITIES=0 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=1 VICTORY_AMBIENT=0.8 VICTORY_D3D12_DRED=light
+VICTORY_TITLE_PRIORITIES=0 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=0 VICTORY_AMBIENT=0.8 VICTORY_D3D12_DRED=light
 VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 VICTORY_TOLD_HOLES=1
 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 VICTORY_PORT_GUARD=1"

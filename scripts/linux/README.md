@@ -43,6 +43,10 @@ behind a "PREPARING SHADERS nn%" bar on the first screens, so the opening cutsce
   Linux and on some Windows cards (7900XTX issue #13). Costs little.
 - `VICTORY_HALF_VIEWS=1` (mouths move) is off unless the launcher uses the patched RADV (below): on the stock RADV the
   two main characters' mouths come out distorted with it.
+- `VICTORY_SHOW_AFTER=0` (play.ps1 has `1`): with `1`, a texture new to its slot shows a grey 1x1 stand-in until its
+  upload has run (a frame, up to four), and trees lose all their leaves for those frames where they come into view or
+  at a cut (frame by frame at the boat checkpoint's mangroves). `0` shows none (stand-ins 90,117 -> 0 in a run), at the
+  same fps. `VICTORY_SHOW_NEW_LATER` (on by default), the guard for textures that in-flight lists may read, stays.
 
 ## Known on Linux
 
