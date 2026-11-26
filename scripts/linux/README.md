@@ -41,15 +41,23 @@ behind a "PREPARING SHADERS nn%" bar on the first screens, so the opening cutsce
 
 - `VICTORY_CARD_STEPS=0`: with `2`, skinned meshes come back wrong (stretched slabs over people, faces lost); seen on
   Linux and on some Windows cards (7900XTX issue #13). Costs little.
-- `VICTORY_HALF_VIEWS=1` (mouths move) is off: on Linux the two main characters' mouths come out distorted and out of
-  time with it, while other characters' are right. On AMDVLK they are right, on RADV (also Mesa 27.0-devel) not.
+- `VICTORY_HALF_VIEWS=1` (mouths move) is off unless the launcher uses the patched RADV (below): on the stock RADV the
+  two main characters' mouths come out distorted with it.
 
 ## Known on Linux
 
-- **Main characters' mouths** with `VICTORY_HALF_VIEWS=1` (or 7900XTX PR #114's version): distorted and mistimed.
-  Ruled out so far: a bad checkpoint save, card steps, relay stage 2, landing echo and the other copy shortcuts (all
-  off together still distorts), the card's handling of 16-bit views (test `heap_half_tests`), the wave form
-  (`VICTORY_HOST_WAVE=32` distorts too). AMD's own driver (AMDVLK 2025.Q2.1) draws them right: it points at RADV.
+- **Main characters' mouths** with `VICTORY_HALF_VIEWS=1` on the stock RADV: distorted (some faces shiny). Found:
+  RADV runs compute shaders that use no shared memory in WGP mode, one workgroup's waves on both CUs of a WGP with a
+  vector L0 cache each, and on RDNA 4 emits no L0 invalidation at a workgroup-scope acquire; the face network's
+  shaders pass values between waves through a buffer across group barriers and read stale ones. Shown on a frame
+  replay of the first diverging pass (bit-identical to the stock driver unpatched; matching a CPU emulation of the
+  console code, and AMDVLK, with the patch) and in game (faces and mouths right).
+  **The fix, used by the launcher alone:** `scripts/linux/build-radv.sh` builds Mesa 26.2.6's RADV with
+  `mesa/radv-cu-mode.patch.txt` into `~/.local/share/victory-proton/mesa-local` (the system's driver is not touched), then
+  in play.conf: `DRIVER_JSON=<the path it prints>` and `RADV_VICTORY_CU_MODE=1 VICTORY_HALF_VIEWS=1` in SWITCHES.
+  `RADV_VICTORY_CU_MODE=1` puts only compute shaders with a workgroup-scope acquire over storage memory in CU mode
+  (`=2`: every compute shader); unset, the patched driver behaves as the stock one. Cost: none measurable (~106 ms a
+  frame either way). The first start after building prepares shaders again behind the bar.
 - `VICTORY_LAND_ECHO=0` moves face faults between characters rather than fixing them.
 - Recording a frame (`VICTORY_RECORD`) works under Proton (the recorder hands lists to vkd3d-proton with their own
   method tables) and needs ~6 GB of RAM more than playing.

@@ -33,10 +33,14 @@ Tested on one PC, with `main` (VIctory-7900XTX's `main` as of 0ce46d5, its 33 me
 
 What is known to be wrong on Linux:
 
-- **Mouths.** By default faces look natural but mouths do not move. With `VICTORY_HALF_VIEWS=1` they move, but the two
-  main characters' mouths are distorted and out of time (other characters' are right). The same build on AMD's own
-  Vulkan driver (AMDVLK) draws them right, and Mesa 27.0-devel still distorts them, so it points at RADV. Being
-  narrowed down pass by pass.
+- **Mouths need a patched RADV.** On the stock driver, `VICTORY_HALF_VIEWS=1` makes mouths move but the main
+  characters' come out distorted and some faces shiny. The cause is in RADV: a compute shader whose threads exchange
+  data through a storage buffer across a workgroup barrier can read stale values when RADV runs the workgroup across
+  both compute units of a WGP (each has its own vector cache, and nothing invalidates it at the barrier). With
+  `scripts/linux/build-radv.sh` (Mesa 26.2.6 plus `scripts/linux/mesa/radv-cu-mode.patch.txt`, built beside the system
+  driver, used by the launcher alone) and `RADV_VICTORY_CU_MODE=1`, such shaders stay on one compute unit and faces and
+  mouths come out right, at no measurable cost. Without it, leave `VICTORY_HALF_VIEWS` off: faces look natural but
+  mouths do not move.
 - `VICTORY_CARD_STEPS=2` (play.ps1's value) hands back wrong skinned meshes (stretched slabs over people, faces lost):
   use `0`, as the Linux launcher does.
 - Glowing eyes in some close-ups; textures that appear late while the title streams.

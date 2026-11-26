@@ -24,8 +24,18 @@ mkdir -p "$W/play-logs"; LOG="$W/play-logs/$(date +%Y%m%d-%H%M%S).log"
 ls -1t "$W"/play-logs/*.log 2>/dev/null | tail -n +11 | xargs -r rm -f
 for kv in $SWITCHES; do export "$kv"; done
 export VICTORY_REPO="$REPO" VICTORY_PROTON="$PROTON" VICTORY_EXE="$EXE" VICTORY_STATE="$W"
-# A Mesa or Proton update changes this, so the startup loading bar makes the pipelines again.
-export VICTORY_HOST_STACK="radv $(stat -c %Y /usr/lib64/libvulkan_radeon.so /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so 2>/dev/null | head -1) proton $(cat "$VICTORY_PROTON/version" 2>/dev/null)"
+# DRIVER_JSON in the conf: a Vulkan driver of our own (the patched RADV that build-radv.sh makes) instead of the system's.
+if [ -n "$DRIVER_JSON" ]; then
+  [ -r "$DRIVER_JSON" ] || { say "No driver at $DRIVER_JSON (DRIVER_JSON in $CONF)."; exit 1; }
+  DRIVER_LIB=$(sed -n 's/.*"library_path": *"\([^"]*\)".*/\1/p' "$DRIVER_JSON")
+  [ -r "$DRIVER_LIB" ] || { say "The driver $DRIVER_JSON names is missing: $DRIVER_LIB"; exit 1; }
+  export VK_ICD_FILENAMES="$DRIVER_JSON" VK_DRIVER_FILES="$DRIVER_JSON"
+  STACK="radv-local $(stat -c %Y "$DRIVER_LIB")"
+else
+  STACK="radv $(stat -c %Y /usr/lib64/libvulkan_radeon.so /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so 2>/dev/null | head -1)"
+fi
+# A driver or Proton change changes this, so the startup loading bar makes the pipelines again.
+export VICTORY_HOST_STACK="$STACK proton $(cat "$VICTORY_PROTON/version" 2>/dev/null)"
 export VICTORY_CACHE_DIR="$CACHE_DIR" VICTORY_DATA_DIR="$DATA_DIR" VICTORY_GAME_DIR="$GAME" VICTORY_MOUNT="$MOUNT"
 say "Starting $NAME. The first screens are up in about 10 s."
 SHOTS="$W/play-shots/$(basename "$LOG" .log)"; mkdir -p "$SHOTS"; echo "$SHOTS" > "$W/play-shots/current"
