@@ -1033,7 +1033,17 @@ fn create() -> windows::core::Result<Host> {
             .is_ok()
         {
             tracing::info!(min = o1.WaveLaneCountMin, max = o1.WaveLaneCountMax, "host wave lanes");
-            victory_shader::emit::set_host_max_wave(o1.WaveLaneCountMax);
+            // `VICTORY_HOST_WAVE=32`: translate as for a card whose waves are at most 32 lanes (as
+            // `victory warm` takes it), to compare the two forms of wave64 programs on one card.
+            let widest = std::env::var("VICTORY_HOST_WAVE")
+                .ok()
+                .and_then(|v| v.parse::<u32>().ok())
+                .filter(|&n| n == 32 || n == 64)
+                .unwrap_or(o1.WaveLaneCountMax);
+            if widest != o1.WaveLaneCountMax {
+                tracing::warn!(widest, "host waves taken as at most this wide (VICTORY_HOST_WAVE)");
+            }
+            victory_shader::emit::set_host_max_wave(widest);
             // (RDNA has waves of 32 and 64, the vendor's older cards of 64 alone.)
             let amd = crate::indirect::amd(&device);
             victory_shader::emit::set_host_rdna(amd && o1.WaveLaneCountMin == 32 && o1.WaveLaneCountMax == 64);

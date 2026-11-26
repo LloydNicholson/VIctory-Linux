@@ -84,6 +84,12 @@ fn build() -> [u8; 32] {
             }
             bytes.push(0);
         }
+        // A host wave width taken from `VICTORY_HOST_WAVE` (only when set, so other runs keep their keys).
+        if let Some(value) = std::env::var_os("VICTORY_HOST_WAVE") {
+            bytes.extend_from_slice(b"VICTORY_HOST_WAVE=");
+            bytes.extend_from_slice(value.as_encoded_bytes());
+            bytes.push(0);
+        }
         // And which clean-up passes ran over the translated code.
         bytes.extend_from_slice(&victory_shader::emit::shader_opt().to_le_bytes());
         bytes
