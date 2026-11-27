@@ -38,9 +38,12 @@ SHOT_EVERY_MIN=3
 # VICTORY_WINDOWS_BAR_MB=4096: our copies of loose title memory go in the card's memory (written through the BAR)
 # instead of the PC's memory shared with the card: 7.0 -> 3.5 GB of that, the card 11.5 -> 13.8 GB, 83.6 -> 81.2 ms in
 # the kitchen; ~1 GB fewer textures get a copy on the card. Drop it if textures go blurry or black outdoors.
+# VICTORY_DSP_PASS=4 VICTORY_DSP_PASS_GAIN=4: phone callers audible. Their voices go through the audio DSP's short
+# "phone speaker" convolution, which the runtime leaves silent; 4 passes those (impulse responses up to 65536 floats)
+# through dry, 4x louder (2 was still soft). Room reverbs stay silent as before.
 SWITCHES="VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 VICTORY_JOIN_COPIES=1
 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=1 VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1
 VICTORY_TITLE_PRIORITIES=0 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=0 VICTORY_AMBIENT=0.8 VICTORY_D3D12_DRED=light
 VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 VICTORY_TOLD_HOLES=1
 VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 VICTORY_PORT_GUARD=1
-VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_WINDOWS_BAR_MB=4096"
+VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_WINDOWS_BAR_MB=4096 VICTORY_DSP_PASS=4 VICTORY_DSP_PASS_GAIN=4"

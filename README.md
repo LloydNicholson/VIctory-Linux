@@ -8,9 +8,9 @@ vkd3d-proton on Mesa's RADV driver, on an AMD Radeon card. It is playable, not f
 **This repository contains no game files, code or assets.** You need your own copy of the game. It is not affiliated
 with or endorsed by the game's developer or publisher.
 
-## Where it stands (2026-11-26)
+## Where it stands (2026-11-27)
 
-Tested on one PC, with `main` (VIctory-7900XTX's `main` as of 0ce46d5, its 33 merged PRs, and this fork's Linux work):
+Tested on one PC, with `main` (VIctory-7900XTX's `main` up to renderer port 6, and this fork's Linux work):
 
 | | |
 |---|---|
@@ -28,10 +28,30 @@ Tested on one PC, with `main` (VIctory-7900XTX's `main` as of 0ce46d5, its 33 me
 | Prologue, prison scene | 86-91 ms a frame (about 11 fps), ~4,700 draws (timed with card steps on) |
 | Crowded prison room | ~120 ms (8 fps), ~10,600 draws |
 | Boat checkpoint ("Just Like Paradise") | 101-116 ms with the stock settings; **about 70 ms (14 fps)** with card steps, renderer ports 2, 5 and 6 and a 1080p output (`scripts/linux/play.conf.example.sh` says how) |
+| Walking about on the first island | ~81-93 ms (11-12 fps) with the example switches; 106.8 ms before the two 16 GB-card switches (`VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_WINDOWS_BAR_MB=4096`) |
 | Opening cutscenes | 100-180 ms |
+| Where the time goes | the thread that prepares submissions, not the card (the card is about half busy); the wineserver takes ~6% of one core |
 | Memory | **32 GB is enough to play**: across six measured runs, with desktop apps open, at least 5.3 GB stayed free and swap grew by about 3 GB (6 GB on a first run with cold caches). |
 
+Fixed since 2026-11-26:
+
+- **Trees and palms no longer drop out** while you move about (whole tree models gone for runs of frames, in
+  binoculars and in normal play, on Windows too). Raw views of buffers whose view did not begin on 16 bytes were made
+  null, so the title's tree culling read zeros; they now begin at the view's own dword (`VICTORY_TWIN_EXACT`, on by
+  default; offered upstream as [avatarmanz/VIctory-7900XTX#437](https://github.com/avatarmanz/VIctory-7900XTX/pull/437)).
+  With `VICTORY_SHOW_AFTER=0` (in the example switches) trees also stop losing their leaves where they come into view.
+- **Phone callers can be heard.** The title plays their voices through the audio DSP's short "phone speaker"
+  convolution, for which the runtime gave silence. `VICTORY_DSP_PASS=4 VICTORY_DSP_PASS_GAIN=4` (in the example
+  switches) passes those voices through dry; the speaker's filtering itself is not done yet.
+- **An on-screen performance HUD** (Belobug's): `VICTORY_PANEL=1` or F3, sized by `VICTORY_PANEL_SCALE` and
+  `VICTORY_PANEL_STEPS`.
+
 What is known to be wrong on Linux:
+
+- **Black ground in places outdoors** (sand under the mangroves solid black, things on it lit) with the Series X
+  profile: the 16 GB card fills up and tens of thousands of textures get no copy on it. Started with
+  `--console series-s` the ground is right (the card holds ~7 GB, the title renders at 1280x720 and upscales); on
+  Series S, `VICTORY_FFX_SCALE` and a larger `VICTORY_OUTPUT` stop the title at start, so leave them off there.
 
 - **Mouths need a workaround in RADV for now.** On the stock driver, `VICTORY_HALF_VIEWS=1` makes mouths move but the
   main characters' come out distorted and some faces shiny. The face network's first pass is a console shader whose
@@ -91,6 +111,7 @@ the next start prepares what that one used.
   runtime now says where its placeholders are. 115 -> 108 ms a frame on the boat checkpoint.
 - **Title pages mapped without the wineserver** (`victory_pages.so`, a Wine unix library that moves a section's pages
   into place with `mremap`): the wineserver walks every view on every map, which cost about 4.7 s a frame; ~0.2 s after.
+- **Trees that stay put** (`VICTORY_TWIN_EXACT`, on) and **phone callers you can hear** (`VICTORY_DSP_PASS=4`): see above.
 - **Radeon and vkd3d-proton fixes**: no reads at address 0 from heap-picked loads or empty root views, an empty
   pipeline library made with a null blob, pipelines whose compile never returns not waited for (64 MB worker stacks),
   one back edge per loop (dxil-spirv recursed without end), waits that notice a lost device.
