@@ -12,6 +12,9 @@ MOUNT=/path/to/the/drive
 # The Vulkan driver: empty for the system's. For moving mouths, build the patched RADV (scripts/linux/build-radv.sh),
 # put the path it prints here, and add RADV_VICTORY_CU_MODE=1 VICTORY_HALF_VIEWS=1 to SWITCHES below.
 DRIVER_JSON=""
+# Extra arguments for victory.exe's run, e.g. "--console series-s": the Series S profile (renders 1280x720 and
+# upscales; on a 16 GB card the Series X profile runs out of card memory outdoors and some ground draws black).
+RUN_ARGS=""
 # Screenshots while you play (play-shots/), minutes apart; 0: none.
 SHOT_EVERY_MIN=3
 # scripts/play.ps1's switches (no ray tracing), with VICTORY_CARD_STEPS=0: on Linux (and on some Windows cards) card

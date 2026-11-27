@@ -45,7 +45,8 @@ if [ "${SHOT_EVERY_MIN:-3}" != 0 ]; then
   ( sleep 60; while ps -eo args | grep -qE '^Z:.*victory\.exe run'; do "$HERE/play-shot.sh" timed >/dev/null 2>&1; sleep $(( ${SHOT_EVERY_MIN:-3} * 60 )); done ) &
   SHOOTER=$!
 fi
-"$HERE/victory.sh" run "$GAME\\game_scarlett_master.exe" --execute > "$LOG" 2>&1
+# RUN_ARGS in the conf (e.g. "--console series-s"): extra arguments for the run; unset: none.
+"$HERE/victory.sh" run "$GAME\\game_scarlett_master.exe" ${RUN_ARGS} --execute > "$LOG" 2>&1
 rc=$?; echo "exit $rc" >> "$LOG"
 [ -n "$SHOOTER" ] && kill "$SHOOTER" 2>/dev/null
 rm -f "$W/play-shots/current"

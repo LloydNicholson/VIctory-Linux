@@ -50,7 +50,7 @@ What is known to be wrong on Linux:
 
 - **Black ground in places outdoors** (sand under the mangroves solid black, things on it lit) with the Series X
   profile: the 16 GB card fills up and tens of thousands of textures get no copy on it. Started with
-  `--console series-s` the ground is right (the card holds ~7 GB, the title renders at 1280x720 and upscales); on
+  `--console series-s` (`RUN_ARGS="--console series-s"` in play.conf) the ground is right (the card holds ~7 GB, the title renders at 1280x720 and upscales); on
   Series S, `VICTORY_FFX_SCALE` and a larger `VICTORY_OUTPUT` stop the title at start, so leave them off there.
 
 - **Mouths need a workaround in RADV for now.** On the stock driver, `VICTORY_HALF_VIEWS=1` makes mouths move but the
