@@ -28,8 +28,19 @@ SHOT_EVERY_MIN=3
 # run, a frame or more, and trees lose their leaves for those frames where they come into view (the boat checkpoint's
 # mangroves: whole frames without leaves at the cut; 0: none, stand-ins 90117 -> 0, same fps). The device-loss guard
 # that matters, VICTORY_SHOW_NEW_LATER (on by default), stays.
+# Port 2 alone (VICTORY_PORT_DESCRIPTORS=1, with 5 and 6 on): 89.7 -> 87.5 ms in the house of the first island, with
+# ~20 warnings a second of "a view record ... no store told of (found by the fallback)": drop it if textures flash.
+# For a 16 GB card (RX 9060 XT/9070 XT class) with resizable BAR on; leave both out on cards with less memory, where
+# they take the textures' room:
+# VICTORY_CARD_BUFFERS_MIN_MB=1: title buffers of 1-4 MiB also get their copy in the card's memory (the default on a
+# 16 GB card is 4 MiB and up), so the card, not the thread that prepares submissions, looks for what shaders wrote in
+# them: 106.8 -> 93.0 ms on the deck, ~100 MB more of the card.
+# VICTORY_WINDOWS_BAR_MB=4096: our copies of loose title memory go in the card's memory (written through the BAR)
+# instead of the PC's memory shared with the card: 7.0 -> 3.5 GB of that, the card 11.5 -> 13.8 GB, 83.6 -> 81.2 ms in
+# the kitchen; ~1 GB fewer textures get a copy on the card. Drop it if textures go blurry or black outdoors.
 SWITCHES="VICTORY_TEXTURE_NO_WAIT=1 VICTORY_RELAY=2 VICTORY_WIDE_BACK=1 VICTORY_CARD_REHASH_RUNS=1 VICTORY_JOIN_COPIES=1
 VICTORY_INDIRECT_WINDOW=1 VICTORY_RELAY_COPY=1 VICTORY_CARD_STEPS=1 VICTORY_INDIRECT_BATCH=2 VICTORY_MAP_THREADS=1
 VICTORY_TITLE_PRIORITIES=0 VICTORY_CARD_AWAKE=1 VICTORY_SHOW_AFTER=0 VICTORY_AMBIENT=0.8 VICTORY_D3D12_DRED=light
 VICTORY_THIN=1 VICTORY_JOIN_PARTS=8 VICTORY_UPLOAD_AHEAD=1 VICTORY_TOLD_HOLES=1
-VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 VICTORY_PORT_GUARD=1"
+VICTORY_PORT_DESCRIPTORS=1 VICTORY_PORT_CBV=1 VICTORY_PORT_GUARD=1
+VICTORY_CARD_BUFFERS_MIN_MB=1 VICTORY_WINDOWS_BAR_MB=4096"

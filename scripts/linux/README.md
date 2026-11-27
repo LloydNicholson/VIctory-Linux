@@ -47,6 +47,17 @@ behind a "PREPARING SHADERS nn%" bar on the first screens, so the opening cutsce
   upload has run (a frame, up to four), and trees lose all their leaves for those frames where they come into view or
   at a cut (frame by frame at the boat checkpoint's mangroves). `0` shows none (stand-ins 90,117 -> 0 in a run), at the
   same fps. `VICTORY_SHOW_NEW_LATER` (on by default), the guard for textures that in-flight lists may read, stays.
+- Two more for a 16 GB card with resizable BAR on (RX 9060 XT, 2026-11-27; leave them out on smaller cards, where
+  they take the textures' room). The frame is held up by the CPU there (the card about half busy):
+  - `VICTORY_CARD_BUFFERS_MIN_MB=1`: title buffers of 1-4 MiB get their copy in the card's memory too (default on
+    16 GB: 4 MiB and up), so the card looks for what shaders wrote in them, not the thread that prepares
+    submissions (11.8 -> 3.0 ms of it a frame): 106.8 -> 93.0 ms on the deck, ~100 MB more of the card.
+  - `VICTORY_WINDOWS_BAR_MB=4096`: our copies of loose title memory go in the card's memory, written through the
+    BAR, instead of the PC's memory shared with the card: that falls 7.0 -> 3.5 GB, the card rises 11.5 -> 13.8 GB,
+    83.6 -> 81.2 ms in the kitchen. About 1 GB fewer textures then get a copy on the card: drop it if textures go
+    blurry or black outdoors.
+- Port 2 (`VICTORY_PORT_DESCRIPTORS=1`) alone, with 5 and 6 on: 89.7 -> 87.5 ms in the house, but ~20 warnings a
+  second of a view record "found by the fallback": drop it if textures flash.
 
 ## Known on Linux
 
