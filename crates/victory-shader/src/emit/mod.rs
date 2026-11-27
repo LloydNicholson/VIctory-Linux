@@ -203,6 +203,26 @@ pub fn half_views_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_VIEWS").is_some_and(|v| v == "1"))
 }
 
+/// Whether a compute program's console cache invalidations (`buffer_gl0_inv`,
+/// `buffer_gl1_inv`: the program is about to read what other groups wrote)
+/// are a device-wide memory fence on the host (`VICTORY_CACHE_FENCES=1`;
+/// off: dropped, the host has caches of its own that keep the older bytes).
+/// Run popfences2 (with [`image_coherent`] on too): a black picture at 1-3
+/// fps. Part of the translation: the shader cache keys on it.
+pub fn cache_fences() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CACHE_FENCES").is_some_and(|v| v == "1"))
+}
+
+/// Whether image loads past the cache (GLC) of unordered views are globally
+/// coherent on the host, as raw buffer loads past it are
+/// (`VICTORY_IMAGE_COHERENT=1`). Part of the translation: the shader cache
+/// keys on it.
+pub fn image_coherent() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_IMAGE_COHERENT").is_some_and(|v| v == "1"))
+}
+
 /// Whether buffer atomics of the ray-tracing structure builder stand between
 /// two fences (`VICTORY_BVH_FENCES=0`: they do not). Part of the
 /// translation: the shader cache keys on it.

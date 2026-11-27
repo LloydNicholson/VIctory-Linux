@@ -322,6 +322,16 @@ pub(crate) fn live_span_bytes() -> u64 {
         + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
 }
 
+/// Bytes alive of buffer copies on the card for the HUD (`host/panel.rs`):
+/// copies' card sides and their "before" twins, windows' card sides
+/// (title memory by address among them) and windows the CPU maps.
+pub(crate) fn card_buffer_bytes() -> u64 {
+    CARD_BYTES[0].load(Ordering::Relaxed)
+        + CARD_BYTES[1].load(Ordering::Relaxed)
+        + WINDOW_CARD_BYTES.load(Ordering::Relaxed)
+        + WINDOW_MAPPED_BYTES.load(Ordering::Relaxed)
+}
+
 /// [`CARD_STATS`], taken; then the copies in the card's memory, their
 /// bytes and their "before" twins' bytes.
 pub(crate) fn card_stats() -> [u64; 10] {
