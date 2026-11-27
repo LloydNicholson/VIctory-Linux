@@ -12,13 +12,20 @@
 //! The transforms themselves are not computed: the hardware takes impulse
 //! responses already in its own partitioned frequency-domain layout, which
 //! is not known. Outputs are silence, so reverb returns are dry.
+//!
+//! Diagnostics: `VICTORY_DSP_LOG=1` logs each stream's activation and, once a
+//! second while it is fed, its commands, gains and input level.
+//! `VICTORY_DSP_PASS` copies a block's input to its output instead of
+//! silence: `1` every stream, `2` transforms only, `3` convolutions only.
 // shortcut: no convolution or block transform; outputs are zeros. Needs the
 // coprocessor's impulse response and spectrum layouts to do better.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
 
 use super::xasync::E_INVALIDARG;
 use super::xgameruntime::{HRESULT, S_OK};
@@ -62,6 +69,66 @@ pub struct Stream {
     frames: u32,
     channels: u32,
     status: Box<Status>,
+    id: u32,
+    kind: u32,
+    level: Level,
+}
+
+/// What `VICTORY_DSP_LOG` reports of a stream's input, per second.
+struct Level {
+    since: Instant,
+    commands: u32,
+    total: u64,
+    gains: [f32; 2],
+    peak: [f32; 2],
+    squares: f64,
+    samples: u64,
+}
+
+impl Level {
+    fn new() -> Self {
+        Self {
+            since: Instant::now(),
+            commands: 0,
+            total: 0,
+            gains: [0.0; 2],
+            peak: [0.0; 2],
+            squares: 0.0,
+            samples: 0,
+        }
+    }
+}
+
+static STREAMS: AtomicU32 = AtomicU32::new(0);
+
+fn log_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_DSP_LOG").is_ok_and(|v| v != "0"))
+}
+
+/// `VICTORY_DSP_PASS`: 0 off, 1 all streams, 2 transforms, 3 convolutions.
+fn pass_mode() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        let mode = std::env::var("VICTORY_DSP_PASS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|m| *m <= 3)
+            .unwrap_or(0);
+        if mode != 0 {
+            tracing::warn!(mode, "audio DSP passes inputs through (VICTORY_DSP_PASS)");
+        }
+        mode
+    })
+}
+
+fn passes(kind: u32) -> bool {
+    match pass_mode() {
+        1 => true,
+        2 => kind != CONVOLUTION,
+        3 => kind == CONVOLUTION,
+        _ => false,
+    }
 }
 
 /// One block of work.
@@ -148,13 +215,13 @@ pub extern "system" fn XDspActivate(
         return E_INVALIDARG;
     }
     let (kind, options, frames, channels) = (desc.kind, desc.options, desc.frames, desc.channels);
-    tracing::debug!(
-        kind,
-        options,
-        frames,
-        channels,
-        "audio DSP stream activated"
-    );
+    let ir_floats = desc.ir_floats;
+    let id = STREAMS.fetch_add(1, Relaxed);
+    if log_on() {
+        tracing::info!(id, kind, options, frames, channels, ir_floats, "audio DSP stream activated");
+    } else {
+        tracing::debug!(kind, options, frames, channels, "audio DSP stream activated");
+    }
     {
         // SAFETY: a connection from `XDspConnectWithMaximumStreamLimit`.
         let dsp = unsafe { &*dsp };
@@ -174,6 +241,9 @@ pub extern "system" fn XDspActivate(
             reserved: 0,
             result: S_OK,
         }),
+        id,
+        kind,
+        level: Level::new(),
     });
     // SAFETY: checked non-null.
     unsafe {
@@ -189,13 +259,56 @@ pub extern "system" fn XDspDeactivate(stream: *mut Stream) -> HRESULT {
     }
     // SAFETY: made by `XDspActivate`; deactivated once.
     let stream = unsafe { Box::from_raw(stream) };
+    if log_on() {
+        tracing::info!(id = stream.id, commands = stream.level.total, "audio DSP stream deactivated");
+    }
     // SAFETY: the connection outlives its streams.
     let dsp = unsafe { &*stream.dsp };
     *dsp.active.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
     S_OK
 }
 
-/// Completes the command at once: its output block is silence.
+/// Adds one command's input to the stream's level and logs it once a second.
+fn measure(stream: &mut Stream, command: &Command) {
+    let frames = stream.frames as usize;
+    let level = &mut stream.level;
+    level.commands += 1;
+    level.total += 1;
+    level.gains = command.gains;
+    if !command.input.is_null() {
+        // SAFETY: the input holds at least one channel's block.
+        let first = unsafe { std::slice::from_raw_parts(command.input, frames) };
+        for &x in first {
+            level.peak[0] = level.peak[0].max(x.abs());
+            level.squares += f64::from(x) * f64::from(x);
+        }
+        level.samples += frames as u64;
+        if stream.channels == 2 {
+            // SAFETY: a stereo stream's block, as the output is.
+            let second = unsafe { std::slice::from_raw_parts(command.input.add(frames), frames) };
+            level.peak[1] = second.iter().fold(level.peak[1], |m, x| m.max(x.abs()));
+        }
+    }
+    if level.since.elapsed().as_secs() >= 1 {
+        let rms = (level.squares / level.samples.max(1) as f64).sqrt() as f32;
+        tracing::info!(
+            id = stream.id,
+            kind = stream.kind,
+            commands = level.commands,
+            gains = ?level.gains,
+            peak = level.peak[0],
+            peak_second_half = level.peak[1],
+            rms,
+            "audio DSP stream fed"
+        );
+        let total = level.total;
+        *level = Level::new();
+        level.total = total;
+    }
+}
+
+/// Completes the command at once: its output block is silence (or, with
+/// `VICTORY_DSP_PASS`, its input).
 pub extern "system" fn XDspSubmitCommand(
     stream: *mut Stream,
     command: *const Command,
@@ -206,10 +319,19 @@ pub extern "system" fn XDspSubmitCommand(
     }
     // SAFETY: a stream from `XDspActivate`, the title's command.
     let (stream, command) = unsafe { (&mut *stream, &*command) };
+    if log_on() {
+        measure(stream, command);
+    }
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
-        // SAFETY: the title's output buffer holds one block of the stream.
-        unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        if !command.input.is_null() && passes(stream.kind) {
+            // SAFETY: input and output each hold one block of the stream;
+            // `copy` allows them to be the same buffer.
+            unsafe { std::ptr::copy(command.input, command.output, samples) };
+        } else {
+            // SAFETY: the title's output buffer holds one block of the stream.
+            unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        }
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
