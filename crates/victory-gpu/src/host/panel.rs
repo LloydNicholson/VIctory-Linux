@@ -134,10 +134,26 @@ const fn glyph(c: u8) -> [u8; 7] {
     }
 }
 
-/// The box's size in pixels at `half` half steps of the logical canvas
-/// ([`scale`]).
-const fn size(half: u32) -> (u32, u32) {
-    (BASE_W * half / 2, BASE_H * half / 2)
+/// The box's size in pixels at `units` steps of the logical canvas
+/// ([`scale`], [`steps`] of them a logical pixel).
+fn size(units: u32) -> (u32, u32) {
+    let s = steps();
+    (BASE_W * units / s, BASE_H * units / s)
+}
+
+/// Steps a logical pixel is cut into (`VICTORY_PANEL_STEPS`: 2, halves, the
+/// default; 4 or 8 for finer sizes, e.g. `VICTORY_PANEL_SCALE=0.5625` with
+/// 8 is 1.125 at 2160 lines, a quarter smaller than 1.5). Finer than halves,
+/// a letter's dots are not all the same width.
+fn steps() -> u32 {
+    static STEPS: OnceLock<u32> = OnceLock::new();
+    *STEPS.get_or_init(|| {
+        std::env::var("VICTORY_PANEL_STEPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|s| [2, 4, 8].contains(s))
+            .unwrap_or(2)
+    })
 }
 
 /// `VICTORY_PANEL_SCALE=<factor>`: multiplies the size the picture's height
@@ -165,8 +181,8 @@ fn scale(height: u32) -> u32 {
 }
 
 fn half_steps(height: u32, factor: f64) -> u32 {
-    let raw = f64::from(height) / 1080.0 * factor;
-    ((raw * 2.0 + 1e-6).floor() as u32).clamp(1, 8)
+    let (raw, s) = (f64::from(height) / 1080.0 * factor, steps());
+    ((raw * f64::from(s) + 1e-6).floor() as u32).clamp(s / 2, 4 * s)
 }
 
 /// Bytes per pixel for a supported swap-chain format.
@@ -288,8 +304,9 @@ impl Canvas {
     fn pack(&self, half: u32, format: DXGI_FORMAT, pitch: usize) -> Vec<u8> {
         let bytes = bpp(format).unwrap_or(4);
         let half = half.max(1) as usize;
-        let (out_w, out_h) = (self.w * half / 2, self.h * half / 2);
-        let from = |o: usize, n: usize| ((2 * o + 1) / half).min(n - 1);
+        let s = steps() as usize;
+        let (out_w, out_h) = (self.w * half / s, self.h * half / s);
+        let from = |o: usize, n: usize| ((2 * o + 1) * s / (2 * half)).min(n - 1);
         let xs: Vec<usize> = (0..out_w).map(|o| from(o, self.w)).collect();
         let mut out = vec![0u8; pitch * out_h];
         let mut edge = [0u8; 8];
