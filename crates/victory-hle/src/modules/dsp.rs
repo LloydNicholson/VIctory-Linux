@@ -16,7 +16,11 @@
 //! Diagnostics: `VICTORY_DSP_LOG=1` logs each stream's activation and, once a
 //! second while it is fed, its commands, gains and input level.
 //! `VICTORY_DSP_PASS` copies a block's input to its output instead of
-//! silence: `1` every stream, `2` transforms only, `3` convolutions only.
+//! silence: `1` every stream, `2` transforms only, `3` convolutions only,
+//! `4` convolutions with a short impulse response (at most
+//! `VICTORY_DSP_PASS_MAX_IR` floats, 65536): the title's phone speaker
+//! (40960 floats), not its room reverbs (135168 and up). A passed block is
+//! scaled by `VICTORY_DSP_PASS_GAIN` (1.0).
 // shortcut: no convolution or block transform; outputs are zeros. Needs the
 // coprocessor's impulse response and spectrum layouts to do better.
 #![allow(non_snake_case)]
@@ -71,6 +75,7 @@ pub struct Stream {
     status: Box<Status>,
     id: u32,
     kind: u32,
+    ir_floats: u32,
     level: Level,
 }
 
@@ -106,27 +111,55 @@ fn log_on() -> bool {
     *ON.get_or_init(|| std::env::var("VICTORY_DSP_LOG").is_ok_and(|v| v != "0"))
 }
 
-/// `VICTORY_DSP_PASS`: 0 off, 1 all streams, 2 transforms, 3 convolutions.
+fn pass_gain() -> f32 {
+    static GAIN: OnceLock<f32> = OnceLock::new();
+    *GAIN.get_or_init(|| {
+        std::env::var("VICTORY_DSP_PASS_GAIN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|g: &f32| g.is_finite() && *g >= 0.0)
+            .unwrap_or(1.0)
+    })
+}
+
+fn pass_max_ir() -> u32 {
+    static MAX: OnceLock<u32> = OnceLock::new();
+    *MAX.get_or_init(|| {
+        std::env::var("VICTORY_DSP_PASS_MAX_IR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0x1_0000)
+    })
+}
+
+/// `VICTORY_DSP_PASS`: 0 off, 1 all streams, 2 transforms, 3 convolutions,
+/// 4 convolutions with a short impulse response.
 fn pass_mode() -> u8 {
     static MODE: OnceLock<u8> = OnceLock::new();
     *MODE.get_or_init(|| {
         let mode = std::env::var("VICTORY_DSP_PASS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .filter(|m| *m <= 3)
+            .filter(|m| *m <= 4)
             .unwrap_or(0);
         if mode != 0 {
-            tracing::warn!(mode, "audio DSP passes inputs through (VICTORY_DSP_PASS)");
+            tracing::warn!(
+                mode,
+                gain = pass_gain(),
+                max_ir = pass_max_ir(),
+                "audio DSP passes inputs through (VICTORY_DSP_PASS)"
+            );
         }
         mode
     })
 }
 
-fn passes(kind: u32) -> bool {
+fn passes(kind: u32, ir_floats: u32) -> bool {
     match pass_mode() {
         1 => true,
         2 => kind != CONVOLUTION,
         3 => kind == CONVOLUTION,
+        4 => kind == CONVOLUTION && ir_floats <= pass_max_ir(),
         _ => false,
     }
 }
@@ -218,7 +251,15 @@ pub extern "system" fn XDspActivate(
     let ir_floats = desc.ir_floats;
     let id = STREAMS.fetch_add(1, Relaxed);
     if log_on() {
-        tracing::info!(id, kind, options, frames, channels, ir_floats, "audio DSP stream activated");
+        let ir_rms = if desc.ir.is_null() || ir_floats == 0 {
+            0.0
+        } else {
+            // SAFETY: the title's impulse response, `ir_floats` long.
+            let ir = unsafe { std::slice::from_raw_parts(desc.ir, ir_floats as usize) };
+            let sum: f64 = ir.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+            (sum / f64::from(ir_floats)).sqrt() as f32
+        };
+        tracing::info!(id, kind, options, frames, channels, ir_floats, ir_rms, "audio DSP stream activated");
     } else {
         tracing::debug!(kind, options, frames, channels, "audio DSP stream activated");
     }
@@ -243,6 +284,7 @@ pub extern "system" fn XDspActivate(
         }),
         id,
         kind,
+        ir_floats,
         level: Level::new(),
     });
     // SAFETY: checked non-null.
@@ -324,10 +366,18 @@ pub extern "system" fn XDspSubmitCommand(
     }
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
-        if !command.input.is_null() && passes(stream.kind) {
+        if !command.input.is_null() && passes(stream.kind, stream.ir_floats) {
             // SAFETY: input and output each hold one block of the stream;
             // `copy` allows them to be the same buffer.
             unsafe { std::ptr::copy(command.input, command.output, samples) };
+            let gain = pass_gain();
+            if gain != 1.0 {
+                // SAFETY: the output block just written.
+                let out = unsafe { std::slice::from_raw_parts_mut(command.output, samples) };
+                for x in out {
+                    *x = (*x * gain).clamp(-1.0, 1.0);
+                }
+            }
         } else {
             // SAFETY: the title's output buffer holds one block of the stream.
             unsafe { std::ptr::write_bytes(command.output, 0, samples) };
