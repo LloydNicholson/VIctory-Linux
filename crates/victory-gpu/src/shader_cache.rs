@@ -266,6 +266,29 @@ fn zeroed_for(container: &[u8]) -> Option<Vec<(u8, u32)>> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    // The per-program diagnostic switches below, looked for once: a run without them
+    // skips them all.
+    static ANY: OnceLock<bool> = OnceLock::new();
+    let any = *ANY.get_or_init(|| {
+        [
+            "VICTORY_CLAMP_PIXEL",
+            "VICTORY_ZERO_INPUT",
+            "VICTORY_NAN_PROBE",
+            "VICTORY_EXACT_FLOAT",
+            "VICTORY_FTZ",
+            "VICTORY_CLAMP_OPS",
+            "VICTORY_DPP_OWN",
+        ]
+        .iter()
+        .any(|name| std::env::var_os(name).is_some())
+    });
+    if !any {
+        let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+        return match CACHE.get() {
+            Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),
+            None => translate(container),
+        };
+    }
     let bound = clamp_for(container);
     let zeroed = zeroed_for(container);
     // `VICTORY_NAN_PROBE=<hash>@<from>-<to>` (byte offsets, hex): see
