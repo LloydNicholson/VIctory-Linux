@@ -449,13 +449,6 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
-/// Whether [`Lower::dpp`] keeps DPP moves that fetch from inactive lanes to
-/// running host lanes where not every lane runs (`VICTORY_DPP_INACTIVE=0`: not).
-pub fn dpp_inactive_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_DPP_INACTIVE").is_none_or(|v| v != "0"))
-}
-
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
@@ -1551,13 +1544,174 @@ thread_local! {
     pub(super) static TEST_RDNA: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
 }
 
+thread_local! {
+    /// [`with_rdna_bits`]: the bits of [`super::rdna`] for the translation on this thread.
+    static RDNA_OVERRIDE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` (a translation) with only `bits` of [`super::rdna`]'s host
+/// shortcuts (0: the console's float rules exactly).
+pub fn with_rdna_bits<T>(bits: u32, f: impl FnOnce() -> T) -> T {
+    let before = RDNA_OVERRIDE.replace(Some(bits));
+    let out = f();
+    RDNA_OVERRIDE.set(before);
+    out
+}
+
 /// The bits of [`super::rdna`] that count on this host.
 pub(super) fn host_rdna() -> u32 {
     #[cfg(test)]
     if let Some(bits) = TEST_RDNA.get() {
         return bits;
     }
+    if let Some(bits) = RDNA_OVERRIDE.get() {
+        return bits;
+    }
     if HOST_RDNA.load(std::sync::atomic::Ordering::Relaxed) { super::rdna_float() } else { 0 }
+}
+
+thread_local! {
+    /// [`with_clamped_colour`]: the bound of a pixel program's colour
+    /// outputs, for the translation running on this thread.
+    static CLAMP_COLOUR: std::cell::Cell<Option<Bound>> = const { std::cell::Cell::new(None) };
+}
+
+thread_local! {
+    /// [`with_zeroed_inputs`]: table places (root slot, dword) whose image
+    /// reads come out 0, and how many reads were met.
+    static ZERO_INPUTS: std::cell::RefCell<(Vec<(u8, u32)>, u32)> = const { std::cell::RefCell::new((Vec::new(), 0)) };
+}
+
+/// Runs `f` (a translation) with every image load, sample or gather from a
+/// descriptor at one of `places` (root slot, dword offset in its table, as
+/// the frame listings name them `s<slot>+<dword>`) giving 0 in all
+/// channels: a diagnostic, to see which input of a program carries bad
+/// values. Also returns how many such reads the translation met.
+pub fn with_zeroed_inputs<T>(places: &[(u8, u32)], f: impl FnOnce() -> T) -> (T, u32) {
+    let before = ZERO_INPUTS.replace((places.to_vec(), 0));
+    let out = f();
+    let (_, met) = ZERO_INPUTS.replace(before);
+    (out, met)
+}
+
+thread_local! {
+    /// [`with_nan_probe`]: the instruction byte range of a pixel program
+    /// whose float results discard the pixel when they are not finite or
+    /// 1e6 or more in size.
+    static NAN_PROBE: std::cell::Cell<Option<(usize, usize)>> = const { std::cell::Cell::new(None) };
+    /// [`with_nan_probe_on`]: only instructions whose name starts so are probed.
+    static NAN_PROBE_ON: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+    /// [`with_nan_only`]: the probe discards on no number only, not infinities.
+    static NAN_ONLY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`with_nan_probe_neg`]: the probe discards on negative results.
+    static NAN_PROBE_NEG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// [`with_nan_probe_limit`]: sizes from this on count as bad (infinity by default).
+    static NAN_PROBE_LIMIT: std::cell::Cell<f32> = const { std::cell::Cell::new(f32::INFINITY) };
+}
+
+/// [`with_nan_probe`] discarding on negative results.
+pub fn with_nan_probe_neg<T>(f: impl FnOnce() -> T) -> T {
+    let before = NAN_PROBE_NEG.replace(true);
+    let out = f();
+    NAN_PROBE_NEG.set(before);
+    out
+}
+
+/// [`with_nan_probe`] counting sizes from `limit` on as bad.
+pub fn with_nan_probe_limit<T>(limit: f32, f: impl FnOnce() -> T) -> T {
+    let before = NAN_PROBE_LIMIT.replace(limit);
+    let out = f();
+    NAN_PROBE_LIMIT.set(before);
+    out
+}
+
+/// [`with_nan_probe`] discarding on no number only.
+pub fn with_nan_only<T>(f: impl FnOnce() -> T) -> T {
+    let before = NAN_ONLY.replace(true);
+    let out = f();
+    NAN_ONLY.set(before);
+    out
+}
+
+/// [`with_nan_probe`] of the instructions whose name starts with `prefix` only.
+pub fn with_nan_probe_on<T>(prefix: &'static str, f: impl FnOnce() -> T) -> T {
+    let before = NAN_PROBE_ON.replace(Some(prefix));
+    let out = f();
+    NAN_PROBE_ON.set(before);
+    out
+}
+
+/// Runs `f` (a translation) with every float VALU result of a pixel
+/// program from an instruction at byte offset `from..=to` checked: a NaN,
+/// an infinity or a size of 1e6 or more discards the pixel there (where its
+/// lane runs). A diagnostic: bisecting the range finds the first
+/// instruction where a bad value arises.
+pub fn with_nan_probe<T>(from: usize, to: usize, f: impl FnOnce() -> T) -> T {
+    let before = NAN_PROBE.replace(Some((from, to)));
+    let out = f();
+    NAN_PROBE.set(before);
+    out
+}
+
+thread_local! {
+    /// [`with_clamped_ops`]: byte range, name prefixes and the bound.
+    static CLAMP_OPS: std::cell::RefCell<Option<(usize, usize, Vec<String>, f32)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` (a translation) with the VGPR results of a pixel program's
+/// instructions at byte offsets `from..=to` whose name starts with one of
+/// `prefixes` bounded to `[-limit, limit]` (a no number becomes `limit`):
+/// a diagnostic that changes only the values that blow up.
+pub fn with_clamped_ops<T>(from: usize, to: usize, prefixes: Vec<String>, limit: f32, f: impl FnOnce() -> T) -> T {
+    let before = CLAMP_OPS.replace(Some((from, to, prefixes, limit)));
+    let out = f();
+    CLAMP_OPS.replace(before);
+    out
+}
+
+thread_local! {
+    /// [`with_dpp_own`]: a pixel program's DPP moves give each lane its own value.
+    static DPP_OWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with a pixel program's DPP lane moves giving
+/// each lane its own value (a diagnostic: whether values read across the
+/// quad are what goes wrong).
+pub fn with_dpp_own<T>(f: impl FnOnce() -> T) -> T {
+    let before = DPP_OWN.replace(true);
+    let out = f();
+    DPP_OWN.set(before);
+    out
+}
+
+/// Whether [`Lower::dpp`] keeps DPP moves that fetch from inactive lanes to
+/// running host lanes where not every lane runs (`VICTORY_DPP_INACTIVE=0`: not).
+pub fn dpp_inactive_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DPP_INACTIVE").is_none_or(|v| v != "0"))
+}
+
+/// How [`with_clamped_colour`] bounds a colour channel.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Bound {
+    /// Into `[0, cap]`: a NaN to 0, an infinity to `cap`.
+    Cap(f32),
+    /// Kept as it is below `limit` in size; a NaN, an infinity or anything
+    /// larger becomes 0. Values a surface can have pass unchanged.
+    Drop(f32),
+}
+
+/// Runs `f` (a translation) with the red, green and blue of every colour
+/// output of a pixel program bounded ([`Bound`]; `Cap` by `dx.op.binary`
+/// FMax then FMin, which return the number when the other operand is a
+/// NaN; `Drop` by an ordered compare of the size, false for a NaN). For a program of the title
+/// that writes garbage into the scene's colour (the terrarium glass with
+/// the ray-tracing structures off), so that bloom does not spread it.
+pub fn with_clamped_colour<T>(bound: Bound, f: impl FnOnce() -> T) -> T {
+    let before = CLAMP_COLOUR.replace(Some(bound));
+    let out = f();
+    CLAMP_COLOUR.set(before);
+    out
 }
 
 /// The refusal of a first half of an interpolation whose result is read
@@ -5000,6 +5154,24 @@ impl<'a> Lower<'a> {
     /// [`Self::write`] of a dword already placed (SDWA applied).
     fn write_placed(&mut self, inst: &Inst, reg: Reg, x: V, guard: Option<V>) {
         let Some(new) = inst.write(reg) else { return };
+        // [`with_clamped_ops`]: results of the chosen instructions bounded to [-limit, limit].
+        let x = match CLAMP_OPS.with_borrow(|c| c.clone()) {
+            Some((from, to, prefixes, limit))
+                if self.s.pixel
+                    && matches!(reg, Reg::V(_))
+                    && (from..=to).contains(&inst.machine.offset)
+                    && prefixes.iter().any(|p| inst.name().starts_with(p.as_str())) =>
+            {
+                let f = self.as_float(x);
+                let hi = self.s.m.f32(limit.to_bits());
+                let lo = self.s.m.f32((-limit).to_bits());
+                // `dx.op.binary` FMin 36 then FMax 35 (a no number becomes the limit).
+                let f = self.binary(36, f, hi);
+                let f = self.binary(35, f, lo);
+                self.as_int(f)
+            }
+            _ => x,
+        };
         let x = match (guard, reg) {
             (Some(g), Reg::V(_)) => {
                 let old = match inst.read(reg).map(|o| self.i32_of(o)) {
@@ -5013,6 +5185,64 @@ impl<'a> Lower<'a> {
             }
             _ => x,
         };
+        if let Some((from, to)) = NAN_PROBE.get()
+            && self.s.pixel
+            && matches!(reg, Reg::V(_))
+            && (from..=to).contains(&inst.machine.offset)
+            && match NAN_PROBE_ON.get() {
+                // `!a,b`: every float instruction but those starting so.
+                Some(prefix) if prefix.starts_with('!') => {
+                    inst.name().starts_with("v_")
+                        && inst.name().ends_with("_f32")
+                        && !inst.name().starts_with("v_cmp")
+                        && !inst.name().starts_with("v_cvt")
+                        && !prefix[1..].split(',').any(|p| inst.name().starts_with(p))
+                }
+                Some(prefix) => inst.name().starts_with(prefix),
+                None => {
+                    inst.name().starts_with("v_")
+                        && inst.name().ends_with("_f32")
+                        && !inst.name().starts_with("v_cmp")
+                        && !inst.name().starts_with("v_cvt")
+                }
+            }
+        {
+            let c = self.cur;
+            let fine = if inst.name().ends_with("_f16") {
+                // A half: either half of the dword with all exponent bits set is an
+                // infinity or no number.
+                let mask = self.s.m.i32(0x7c00);
+                let low = self.s.m.bin(c, Bin::And, x, mask);
+                let low_bad = self.s.m.cmp(c, pred::EQ, low, mask);
+                let k16 = self.s.m.i32(16);
+                let high = self.s.m.bin(c, Bin::LShr, x, k16);
+                let high = self.s.m.bin(c, Bin::And, high, mask);
+                let high_bad = self.s.m.cmp(c, pred::EQ, high, mask);
+                let bad = self.s.m.bin(c, Bin::Or, low_bad, high_bad);
+                let t = self.s.m.bool(true);
+                self.s.m.bin(c, Bin::Xor, bad, t)
+            } else if NAN_PROBE_NEG.get() {
+                // Negative (or no number) counts.
+                let f = self.as_float(x);
+                let zero = self.s.m.f32(0);
+                self.s.m.cmp(c, pred::OGE, f, zero)
+            } else if NAN_ONLY.get() {
+                // Only no number counts (infinities pass).
+                let f = self.as_float(x);
+                self.s.m.cmp(c, pred::ORD, f, f)
+            } else {
+                let f = self.as_float(x);
+                let size = self.unary(6, f);
+                let limit = self.s.m.f32(NAN_PROBE_LIMIT.get().to_bits());
+                self.s.m.cmp(c, pred::OLT, size, limit)
+            };
+            let t = self.s.m.bool(true);
+            let mut kill = self.s.m.bin(c, Bin::Xor, fine, t);
+            if let Some(g) = guard {
+                kill = self.s.m.bin(c, Bin::And, kill, g);
+            }
+            self.s.op(c, "discard", Attr::NoUnwind, self.s.t.void, 82, &[kill]);
+        }
         self.vals.insert(new, Val::I32(x));
     }
 
@@ -8608,7 +8838,10 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if DPP_OWN.get() && self.s.pixel {
+            // [`with_dpp_own`]: each lane its own value.
+            x
+        } else if mesh_quad {
             self.quad_pick(x, src)
         } else if let Dpp::Row { ctrl, .. } = dpp
             && self.helpers_read(quad)
@@ -11552,6 +11785,20 @@ impl<'a> Lower<'a> {
             || self
                 .used_kind(src)
                 .is_some_and(|u| u.kind == ResourceType::Uav);
+        // (A place with slot 255 names an image dimension instead: every read of that
+        // `dim` field, wherever its descriptor comes from; 3 is a cube.)
+        let zeroed = !store
+            && !name.starts_with("image_atomic_")
+            && ZERO_INPUTS.with_borrow(|(places, _)| {
+                !places.is_empty()
+                    && (places.contains(&(255, u32::from(*dim)))
+                        || places.contains(&(253, inst.machine.offset as u32))
+                        || (places.contains(&(254, 0))
+                            && !self.used_kind(src).is_some_and(|u| u.root == RootType::Table))
+                        || self.used_kind(src).is_some_and(|u| {
+                            u.root == RootType::Table && places.contains(&(u.slot, u.table_offset_dwords))
+                        }))
+            });
         // A UAV inside an ordered section is a rasterizer ordered view.
         let ordered = uav && self.ordered.contains(&site);
         if ordered {
@@ -12291,7 +12538,11 @@ impl<'a> Lower<'a> {
                 })
                 .collect();
         }
+        if zeroed {
+            ZERO_INPUTS.with_borrow_mut(|(_, met)| *met += 1);
+        }
         for (k, x) in xs.into_iter().enumerate() {
+            let x = if zeroed { self.s.m.i32(0) } else { x };
             self.write(inst, Reg::V(reg + k as u8), x, guard);
         }
         Ok(())
@@ -13130,7 +13381,7 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            let (suffix, mut x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -13141,6 +13392,29 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            if let Some(bound) = CLAMP_COLOUR.get()
+                && self.s.pixel
+                && matches!(e.target, Target::Color(_))
+                && suffix == ".f32"
+                && col < 3
+            {
+                let zero = self.s.m.f32(0f32.to_bits());
+                match bound {
+                    Bound::Cap(cap) => {
+                        let cap = self.s.m.f32(cap.to_bits());
+                        // `dx.op.binary`: FMax 35, FMin 36.
+                        let up = self.binary(35, x, zero);
+                        x = self.binary(36, up, cap);
+                    }
+                    Bound::Drop(limit) => {
+                        let limit = self.s.m.f32(limit.to_bits());
+                        // `dx.op.unary` FAbs 6; ordered less-than is false for a NaN.
+                        let size = self.unary(6, x);
+                        let fine = self.s.m.cmp(self.cur, pred::OLT, size, limit);
+                        x = self.s.m.select(self.cur, fine, x, zero);
+                    }
+                }
+            }
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),

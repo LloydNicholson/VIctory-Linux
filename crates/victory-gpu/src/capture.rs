@@ -16,9 +16,41 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
         .as_ref()
 }
 
+/// The file `<folder>\go` (what the clip key makes, `play-clip.sh`) lists the
+/// next frames without their numbers being known beforehand: when it is
+/// found (looked for once a frame, with `VICTORY_CAPTURE` set) it is removed,
+/// and the 2nd frame after the one that found it and the
+/// `VICTORY_CAPTURE_TRIGGER_FRAMES` (3) after that are listed, whole frames
+/// from their first draw, as if named in `VICTORY_CAPTURE_FRAMES`. With
+/// `VICTORY_DUMP_TARGETS=1` their targets are saved and their NaN and
+/// infinite texels counted ("target values" lines).
+fn triggered(n: u64) -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static POLLED: AtomicU64 = AtomicU64::new(0);
+    static START: AtomicU64 = AtomicU64::new(u64::MAX);
+    static COUNT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let Some(folder) = folder() else { return false };
+    if POLLED.fetch_max(n, Relaxed) < n && START.load(Relaxed) == u64::MAX {
+        let go = folder.join("go");
+        if go.exists() {
+            let _ = std::fs::remove_file(&go);
+            let count = *COUNT.get_or_init(|| {
+                std::env::var("VICTORY_CAPTURE_TRIGGER_FRAMES").ok().and_then(|v| v.parse().ok()).unwrap_or(3)
+            });
+            START.store(n + 2, Relaxed);
+            tracing::info!(found_at = n, first = n + 2, count, "capture trigger: frames listed");
+        }
+    }
+    let start = START.load(Relaxed);
+    start != u64::MAX && n >= start && n < start + *COUNT.get().unwrap_or(&3)
+}
+
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
 /// too, and their draws traced at debug level.
 pub(crate) fn listed(n: u64) -> bool {
+    if triggered(n) {
+        return true;
+    }
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let named = LIST
         .get_or_init(|| {
@@ -377,6 +409,7 @@ pub(crate) fn note_target(resource: crate::object::This) {
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     use std::sync::atomic::Ordering::Relaxed;
+    texel_report(frame);
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
     let Some(host) = crate::host::host() else { return };
     for (i, (resource, copy)) in targets.iter().enumerate() {
@@ -540,6 +573,7 @@ fn half(h: u16) -> f32 {
     let (sign, exp, man) = ((h >> 15) as u32, ((h >> 10) & 0x1f) as i32, (h & 0x3ff) as f32);
     let v = match exp {
         0 => man * 2f32.powi(-24),
+        31 if man != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + man / 1024.0) * 2f32.powi(e - 15),
     };
@@ -552,6 +586,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
     let (exp, m) = ((bits >> man) & 0x1f, (bits & ((1 << man) - 1)) as f32);
     match exp {
         0 => m / (1 << man) as f32 * 2f32.powi(-14),
+        31 if m != 0.0 => f32::NAN,
         31 => f32::INFINITY,
         e => (1.0 + m / (1 << man) as f32) * 2f32.powi(e as i32 - 15),
     }
@@ -654,7 +689,10 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     // lamp on black have the same highest value.
     let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
     let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
-    tracing::info!(format, low, high, nonzero_percent, "target values");
+    // Texels with a NaN or an infinite channel (shown black and full).
+    let nan_texels = values.iter().filter(|v| v.iter().any(|c| c.is_nan())).count();
+    let inf_texels = values.iter().filter(|v| v.iter().any(|c| c.is_infinite())).count();
+    tracing::info!(format, low, high, nonzero_percent, nan_texels, inf_texels, "target values");
     // Small float colour targets (the 1x1 luminance and exposure targets):
     // every texel's four channels as numbers. The picture has no alpha and
     // eight bits a channel.
@@ -865,8 +903,281 @@ pub(crate) fn recent_levels() -> Vec<u8> {
     levels.iter().copied().collect()
 }
 
+
+/// `VICTORY_TEXEL_TRACE=<x>,<y>,<w>,<h>` (target pixels): in the frames
+/// [`listed`], before every draw into an R16G16B16A16_FLOAT target that
+/// holds the box, the box is copied aside (in the draw's own list, the
+/// target moved to a copy source and back); at the frame's present every
+/// copy's NaN, infinite and huge (65,000 and up, the half-float limit is
+/// 65,504) texels and its largest finite value go to
+/// `frame-<n>-texels.txt` in the capture folder, per list in recording
+/// order with the draw's pipeline. Dispatches and draws into other targets
+/// are listed between them, not copied. Whatever made the box bad lies
+/// between the last clean copy and the first bad one of that target.
+fn trace_area() -> Option<[u32; 4]> {
+    static AREA: std::sync::OnceLock<Option<[u32; 4]>> = std::sync::OnceLock::new();
+    *AREA.get_or_init(|| {
+        let v: Vec<u32> = std::env::var("VICTORY_TEXEL_TRACE")
+            .ok()?
+            .split(',')
+            .filter_map(|n| n.trim().parse().ok())
+            .collect();
+        let a: [u32; 4] = v.try_into().ok()?;
+        (a[2] > 0 && a[3] > 0).then_some(a)
+    })
+}
+
+struct TexelSample {
+    list: usize,
+    what: String,
+    target: usize,
+    at: Option<u64>,
+}
+
+struct TexelFrame {
+    frame: u64,
+    buffer: Option<ID3D12Resource>,
+    next: u64,
+    samples: Vec<TexelSample>,
+}
+
+static TEXEL_FRAMES: std::sync::Mutex<Vec<TexelFrame>> = std::sync::Mutex::new(Vec::new());
+/// Bytes of read-back memory a frame's copies may take.
+const TEXEL_BYTES: u64 = 96 << 20;
+
+fn texel_pitch(w: u32) -> u64 {
+    (u64::from(w) * 8).next_multiple_of(256)
+}
+
+fn readback_buffer(device: &ID3D12Device, bytes: u64) -> Option<ID3D12Resource> {
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: bytes,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let mut buffer: Option<ID3D12Resource> = None;
+    // SAFETY: plain creation.
+    unsafe {
+        device
+            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+            .ok()?;
+    }
+    buffer
+}
+
+/// Before a draw (`targets`: the title's render targets; empty for a
+/// dispatch): see [`trace_area`].
+pub(crate) fn trace_texels(list: &crate::host::HostList, targets: &[usize], what: impl FnOnce() -> String) {
+    let Some([x, y, w, h]) = trace_area() else { return };
+    let frame = crate::queue::presented() + 1;
+    if !listed(frame) {
+        return;
+    }
+    let Some(host) = crate::host::host() else { return };
+    let what = what();
+    let pitch = texel_pitch(w);
+    let bytes = (pitch * u64::from(h)).next_multiple_of(512);
+    let me = std::ptr::from_ref(list) as usize;
+    let mut frames = TEXEL_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+    let i = match frames.iter().position(|f| f.frame == frame) {
+        Some(i) => i,
+        None => {
+            frames.push(TexelFrame { frame, buffer: None, next: 0, samples: Vec::new() });
+            frames.len() - 1
+        }
+    };
+    let f = &mut frames[i];
+    let mut sampled = false;
+    for &t in targets {
+        let Some(copy) = crate::resource::host_copy(t as crate::object::This) else { continue };
+        // SAFETY: a live resource.
+        let d = unsafe { copy.texture.GetDesc() };
+        if d.Format != DXGI_FORMAT_R16G16B16A16_FLOAT
+            || d.Width < u64::from(x + w)
+            || d.Height < y + h
+            || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
+        {
+            continue;
+        }
+        if f.buffer.is_none() {
+            f.buffer = readback_buffer(&host.device, TEXEL_BYTES);
+        }
+        let Some(buffer) = f.buffer.clone() else { break };
+        if f.next + bytes > TEXEL_BYTES {
+            f.samples.push(TexelSample { list: me, what: format!("{what} (no room)"), target: t, at: None });
+            continue;
+        }
+        let at = f.next;
+        f.next += bytes;
+        const COPY: u32 = D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32;
+        let moved = list.transition(t as crate::object::This, COPY);
+        // SAFETY: an open list; live textures; the box lies inside the
+        // texture and the slot inside the buffer.
+        unsafe {
+            if let Some((texture, before)) = moved {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    texture,
+                    D3D12_RESOURCE_STATES(before as i32),
+                    D3D12_RESOURCE_STATE_COPY_SOURCE,
+                )]);
+            }
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&buffer),
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: at,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
+                            Width: w,
+                            Height: h,
+                            Depth: 1,
+                            RowPitch: pitch as u32,
+                        },
+                    },
+                },
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                pResource: std::mem::transmute_copy(&copy.texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            let area = D3D12_BOX { left: x, top: y, front: 0, right: x + w, bottom: y + h, back: 1 };
+            list.list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&area));
+            if let Some((_, before)) = moved
+                && let Some((texture, now)) = list.transition(t as crate::object::This, before)
+            {
+                list.list.ResourceBarrier(&[crate::host::transition(
+                    texture,
+                    D3D12_RESOURCE_STATES(now as i32),
+                    D3D12_RESOURCE_STATES(before as i32),
+                )]);
+            }
+        }
+        f.samples.push(TexelSample { list: me, what: what.clone(), target: t, at: Some(at) });
+        sampled = true;
+    }
+    if !sampled {
+        f.samples.push(TexelSample { list: me, what, target: 0, at: None });
+    }
+}
+
+/// At the present of `frame`, after every submission: the copies of
+/// [`trace_texels`] written out.
+fn texel_report(frame: u64) {
+    use std::io::Write;
+    let Some([x, y, w, h]) = trace_area() else { return };
+    let taken = {
+        let mut frames = TEXEL_FRAMES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(i) = frames.iter().position(|f| f.frame == frame) else { return };
+        frames.remove(i)
+    };
+    let Some(folder) = folder() else { return };
+    let Ok(mut out) = std::fs::File::create(folder.join(format!("frame-{frame}-texels.txt"))) else { return };
+    let _ = writeln!(out, "box {x},{y} {w}x{h}; per sample: list, target, nan, inf, huge (>= 65000), largest finite, what");
+    let pitch = texel_pitch(w) as usize;
+    let mut data = std::ptr::null_mut();
+    let mapped = taken.buffer.as_ref().is_some_and(|b| {
+        // SAFETY: the frame's lists have run (every submission was waited for).
+        unsafe { b.Map(0, None, Some(&mut data)) }.is_ok()
+    });
+    let (mut sampled, mut bad) = (0, 0);
+    for (n, s) in taken.samples.iter().enumerate() {
+        let Some(at) = s.at.filter(|_| mapped) else {
+            let _ = writeln!(out, "{n} list {:#x} -  {}", s.list, s.what);
+            continue;
+        };
+        let (mut nan, mut inf, mut huge, mut most, mut sum) = (0u32, 0u32, 0u32, 0f32, 0f64);
+        for row in 0..h as usize {
+            // SAFETY: the slot's rows lie inside the mapped buffer.
+            let line = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(at as usize + row * pitch), w as usize * 8) };
+            for texel in line.chunks_exact(8) {
+                let c: Vec<f32> = (0..3).map(|k| half(u16::from_le_bytes([texel[2 * k], texel[2 * k + 1]]))).collect();
+                if c.iter().any(|v| v.is_nan()) {
+                    nan += 1;
+                } else if c.iter().any(|v| v.is_infinite()) {
+                    inf += 1;
+                } else {
+                    let m = c.iter().fold(0f32, |a, v| a.max(*v));
+                    if m >= 65000.0 {
+                        huge += 1;
+                    }
+                    most = most.max(m);
+                    sum += c.iter().map(|v| f64::from(*v)).sum::<f64>();
+                }
+            }
+        }
+        sampled += 1;
+        if nan + inf + huge > 0 {
+            bad += 1;
+        }
+        let _ = writeln!(out, "{n} list {:#x} target {:#x} nan {nan} inf {inf} huge {huge} max {most} {} sum {sum:.3}", s.list, s.target, s.what);
+    }
+    if mapped && let Some(b) = taken.buffer.as_ref() {
+        // SAFETY: mapped above.
+        unsafe { b.Unmap(0, None) };
+    }
+    tracing::info!(frame, samples = taken.samples.len(), sampled, bad, "texel trace written");
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn half_classifies_special_and_finite_values() {
+        use super::half;
+
+        assert!(half(0x7c01).is_nan());
+        assert!(half(0xfe00).is_nan());
+        assert_eq!(half(0x7c00), f32::INFINITY);
+        assert_eq!(half(0xfc00), f32::NEG_INFINITY);
+        assert_eq!(half(0x0000).to_bits(), 0.0f32.to_bits());
+        assert_eq!(half(0x8000).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(half(0x0001), 2f32.powi(-24));
+        assert_eq!(half(0xbe00), -1.5);
+    }
+
+    #[test]
+    fn packed_float_classifies_special_and_finite_values() {
+        use super::small_float;
+
+        for mantissa_bits in [5, 6] {
+            let special = 31 << mantissa_bits;
+            assert!(small_float(special | 1, mantissa_bits).is_nan());
+            assert!(small_float(special | (1 << (mantissa_bits - 1)), mantissa_bits).is_nan());
+            assert_eq!(small_float(special, mantissa_bits), f32::INFINITY);
+            assert_eq!(small_float(0, mantissa_bits).to_bits(), 0.0f32.to_bits());
+            assert_eq!(small_float(1, mantissa_bits), 2f32.powi(-14 - mantissa_bits as i32));
+            assert_eq!(small_float(15 << mantissa_bits, mantissa_bits), 1.0);
+        }
+    }
+
+    #[test]
+    fn hdr_targets_render_nan_and_infinity_as_distinct_channel_values() {
+        // R16G16B16A16_FLOAT: [NaN, +Inf, NaN], [1, 0.5, 0].
+        let half = [0x7c01u16, 0x7c00, 0xfe00, 0, 0x3c00, 0x3800, 0, 0];
+        let half: Vec<_> = half.into_iter().flat_map(u16::to_le_bytes).collect();
+        // R11G11B10_FLOAT: the same values with 6-bit and 5-bit mantissas.
+        let packed = [
+            0x7c1u32 | (0x7c0 << 11) | (0x3e1 << 22),
+            0x3c0 | (0x380 << 11),
+        ];
+        let packed: Vec<_> = packed.into_iter().flat_map(u32::to_le_bytes).collect();
+        let expected = [0, 255, 0, 255, 255, 127, 0, 255];
+        for (format, row) in [(10, half), (26, packed)] {
+            assert_eq!(
+                super::to_rgba(format, 2, 1, row.len(), &row).as_deref(),
+                Some(&expected[..]),
+                "format {format}"
+            );
+        }
+    }
+
     #[test]
     fn crc_matches_the_png_check_value() {
         assert_eq!(super::crc32(b"IEND"), 0xae42_6082);

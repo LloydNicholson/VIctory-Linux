@@ -184,6 +184,20 @@ struct Block {
     term: Option<Term>,
 }
 
+thread_local! {
+    /// [`with_ftz`]: the module written on this thread flushes 32-bit denormals.
+    static FTZ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `f` (a translation) with the modules written giving their entry
+/// `"fp32-denorm-mode"="ftz"`.
+pub fn with_ftz<T>(f: impl FnOnce() -> T) -> T {
+    let before = FTZ.replace(true);
+    let out = f();
+    FTZ.set(before);
+    out
+}
+
 /// Function attributes of a `dx.op` declaration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Attr {
@@ -643,7 +657,10 @@ impl Module {
         w.enter(MODULE_BLOCK, 3);
         w.record(1, &[1]); // VERSION: relative value ids
 
-        // Attribute groups 1-4 and one list per group.
+        // Attribute groups 1-4 and one list per group; with [`with_ftz`] a 5th, the
+        // entry's `"fp32-denorm-mode"="ftz"` (32-bit denormals flushed, as the console's
+        // MODE has them).
+        let ftz = FTZ.get();
         w.enter(PARAMATTR_GROUP_BLOCK, 3);
         for (id, kinds) in [
             (1, &[18u64, 20][..]),
@@ -657,9 +674,17 @@ impl Module {
             }
             w.record(3, &r);
         }
+        if ftz {
+            let mut r = vec![5, 0xFFFF_FFFF, 4];
+            r.extend(b"fp32-denorm-mode".iter().map(|&b| u64::from(b)));
+            r.push(0);
+            r.extend(b"ftz".iter().map(|&b| u64::from(b)));
+            r.push(0);
+            w.record(3, &r);
+        }
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
-        for id in 1..=4 {
+        for id in 1..=if ftz { 5 } else { 4 } {
             w.record(2, &[id]);
         }
         w.exit();
@@ -725,7 +750,11 @@ impl Module {
         for f in &self.funcs {
             // [type, cc, isproto, linkage, paramattr, align, section,
             // visibility, gc, unnamed_addr, prologue, dllstorage, comdat, prefix]
-            let attr = f.attr.map_or(0, |a| a as u64);
+            let attr = match f.attr {
+                Some(a) => a as u64,
+                None if ftz && f.body => 5,
+                None => 0,
+            };
             w.record(
                 8,
                 &[

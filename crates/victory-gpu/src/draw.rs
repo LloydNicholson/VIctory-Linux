@@ -2992,6 +2992,8 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
+        crate::capture::trace_texels(list, &[], || self.trace_name("dispatch"));
+        #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_builder(self.pipeline as This) {
@@ -3162,6 +3164,17 @@ impl State {
     /// (with the view at that heap index, if one is), the host addresses
     /// of its root views and the views its tables name.
     #[cfg(feature = "diagnostics")]
+    /// What [`crate::capture::trace_texels`] calls a draw or dispatch: its
+    /// kind and its pipeline's shaders.
+    #[cfg(feature = "diagnostics")]
+    fn trace_name(&self, kind: &str) -> String {
+        match crate::pipeline::host_pipeline(self.pipeline as This) {
+            Some(p) => format!("{kind} {}", p.name),
+            None => kind.to_owned(),
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
@@ -3216,6 +3229,93 @@ impl State {
                     let host = crate::shadow::find(*address, 1)
                         .map(|s| (s.gpu(*address), s.left(*address)));
                     let _ = write!(text, " root{slot}={address:#x} host {host:#x?}");
+                }
+            }
+        }
+        // `VICTORY_PICK_STORY=<pixel hash>@<buffer title address hex>@<user data index>@<byte adds, comma-free: 0+4+12+20>`
+        // (diagnostics): for that program's draws, the heap slots its material record names
+        // (32-bit words at address + the user data value + each add) and what our heap holds there.
+        #[cfg(feature = "diagnostics")]
+        if let Ok(v) = std::env::var("VICTORY_PICK_STORY") {
+            let parts: Vec<&str> = v.split('@').collect();
+            if let [hash, base, user, adds] = parts[..]
+                && p.stages.iter().any(|st| st.shader.hash == hash)
+                && let Ok(user) = user.parse::<u32>()
+                // The buffer: a title address, or `s<slot>+<dword>`: the view at that table
+                // place (its title address, as described: "... at 0x...").
+                && let Some(base) = match base.strip_prefix('s').and_then(|b| b.split_once('+')) {
+                    Some((slot, dword)) => slot.parse::<usize>().ok().zip(dword.parse::<u64>().ok()).and_then(|(slot, dword)| {
+                        match self.roots_ref(compute).get(slot) {
+                            Some(Root::Table(table)) => {
+                                let text = describe(crate::descriptor::view(table + dword * 4).as_ref());
+                                let at = text.rsplit(" at 0x").next().filter(|_| text.contains(" at 0x"))?;
+                                let hex: String = at.chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                                u64::from_str_radix(&hex, 16).ok()
+                            }
+                            _ => None,
+                        }
+                    }),
+                    None => u64::from_str_radix(base.trim_start_matches("0x"), 16).ok(),
+                }
+            {
+                let _ = write!(text, " pickbase={base:#x}");
+                let value = p.stages.iter().find_map(|st| {
+                    let t = st.translated();
+                    t.host.user_data.iter().find(|u| u.index == user).map(|u| match u.root {
+                        RootType::Other(kind) => self.host_word(compute, kind, u.slot, u.dword, None),
+                        _ => self.user_value(compute, u.slot, u.root, u.dword),
+                    })
+                });
+                if let Some(value) = value {
+                    for add in adds.split('+').filter_map(|a| a.parse::<u64>().ok()) {
+                        let at = base + u64::from(value) + add;
+                        let mut word = [0u8; 4];
+                        if crate::host::read_into(at as *const u8, &mut word) {
+                            let slot = u32::from_le_bytes(word);
+                            let _ = write!(
+                                text,
+                                " pick+{add}@{at:#x}=slot {slot} [{}]",
+                                crate::descriptor::host::slot_story(slot)
+                            );
+                        } else {
+                            let _ = write!(text, " pick+{add}@{at:#x}=unreadable");
+                        }
+                    }
+                }
+            }
+        }
+        // `VICTORY_TITLE_DUMP=<program hash>@s<slot>+<dword>@<bytes>` (diagnostics): the title
+        // memory a placed view of that program's table holds, read on the CPU and written to
+        // `title-<frame>-<address>.bin` in the capture folder (once a frame).
+        #[cfg(feature = "diagnostics")]
+        if let Ok(v) = std::env::var("VICTORY_TITLE_DUMP") {
+            let parts: Vec<&str> = v.split('@').collect();
+            if let [hash, place, bytes] = parts[..]
+                && p.stages.iter().any(|st| st.shader.hash == hash)
+                && let Some((slot, dword)) = place.strip_prefix('s').and_then(|b| b.split_once('+'))
+                && let (Ok(slot), Ok(dword), Ok(bytes)) = (slot.parse::<usize>(), dword.parse::<u64>(), bytes.parse::<usize>())
+                && let Some(Root::Table(table)) = self.roots_ref(compute).get(slot)
+            {
+                let described = describe(crate::descriptor::view(table + dword * 4).as_ref());
+                let hex: String = described
+                    .rsplit(" at 0x")
+                    .next()
+                    .filter(|_| described.contains(" at 0x"))
+                    .map(|a| a.chars().take_while(|c| c.is_ascii_hexdigit()).collect())
+                    .unwrap_or_default();
+                static DONE: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+                let frame = crate::queue::presented() + 1;
+                if let Ok(at) = u64::from_str_radix(&hex, 16)
+                    && let Some(folder) = crate::capture::folder()
+                {
+                    let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
+                    if *done != frame {
+                        *done = frame;
+                        let mut data = vec![0u8; bytes];
+                        let ok = crate::host::read_into(at as *const u8, &mut data);
+                        let _ = std::fs::write(folder.join(format!("title-{frame}-{at:#x}.bin")), &data);
+                        let _ = write!(text, " titledump {at:#x} {bytes} read {ok} ({described})");
+                    }
                 }
             }
         }
@@ -3419,6 +3519,8 @@ impl State {
             && self.prepare_for(list, false, true)
             && match list.list.cast::<ID3D12GraphicsCommandList6>() {
                 Ok(l6) => {
+                    #[cfg(feature = "diagnostics")]
+                    crate::capture::trace_texels(list, &self.targets, || self.trace_name("mesh"));
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
@@ -3965,6 +4067,8 @@ impl State {
                 (vertices, first)
             };
             #[cfg(feature = "diagnostics")]
+            crate::capture::trace_texels(list, &self.targets, || self.trace_name("draw"));
+            #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
             // SAFETY: an open list with everything set.
             unsafe {
@@ -4069,6 +4173,8 @@ impl State {
         }
         let ran = !lost && self.prepare(list, true);
         if ran {
+            #[cfg(feature = "diagnostics")]
+            crate::capture::trace_texels(list, &self.targets, || self.trace_name("indexed"));
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
             // SAFETY: an open list with everything set.
@@ -4350,6 +4456,10 @@ impl State {
             why("prepare failed");
             return false;
         }
+        #[cfg(feature = "diagnostics")]
+        crate::capture::trace_texels(list, if kind == DISPATCH { &[] } else { &self.targets }, || {
+            self.trace_name(&format!("indirect kind {kind}"))
+        });
         #[cfg(feature = "diagnostics")]
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)

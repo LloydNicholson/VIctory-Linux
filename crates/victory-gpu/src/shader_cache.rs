@@ -188,9 +188,176 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
     Ok(MISSES.load(Ordering::Relaxed) == misses)
 }
 
+/// `VICTORY_CLAMP_PIXEL=<hash>[:<cap>|:drop<limit>][,...]`: pixel programs
+/// (by the 16-digit hash logs give them) whose colour outputs are bounded
+/// ([`victory_shader::emit::with_clamped_colour`]): `:<cap>` into
+/// `[0, cap]` (1 when nothing is given), NaN to 0; `:drop<limit>` keeps
+/// what is smaller than `limit` and makes a NaN, an infinity or anything
+/// larger 0. They are translated afresh in every run and not cached, so
+/// the cache's key stays the same.
+fn clamp_for(container: &[u8]) -> Option<victory_shader::emit::ColourBound> {
+    use victory_shader::emit::ColourBound;
+    static LIST: OnceLock<Vec<(String, ColourBound)>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_CLAMP_PIXEL")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|item| {
+                let (hash, how) = item.trim().split_once(':').unwrap_or((item.trim(), "1"));
+                let how = how.trim();
+                let (drop, number) = match how.strip_prefix("drop") {
+                    Some(rest) => (true, rest),
+                    None => (false, how),
+                };
+                let n: f32 = number.trim().parse().ok().filter(|c: &f32| c.is_finite() && *c > 0.0)?;
+                let bound = if drop { ColourBound::Drop(n) } else { ColourBound::Cap(n) };
+                (hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .then(|| (hash.to_ascii_lowercase(), bound))
+            })
+            .collect()
+    });
+    if list.is_empty() {
+        return None;
+    }
+    let hash = blake3::hash(container).to_hex();
+    list.iter().find(|(h, _)| h.as_str() == &hash[..16]).map(|&(_, bound)| bound)
+}
+
+/// `VICTORY_ZERO_INPUT=<hash>@s<slot>+<dword>[@...][,...]` (a diagnostic):
+/// image reads of the named programs from those table places give 0
+/// ([`victory_shader::emit::with_zeroed_inputs`]); translated afresh, not
+/// cached.
+fn zeroed_for(container: &[u8]) -> Option<Vec<(u8, u32)>> {
+    static LIST: OnceLock<Vec<(String, Vec<(u8, u32)>)>> = OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_ZERO_INPUT")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|item| {
+                let mut parts = item.trim().split('@');
+                let hash = parts.next()?.trim().to_ascii_lowercase();
+                let places: Vec<(u8, u32)> = parts
+                    .filter_map(|p| {
+                        if let Some(at) = p.trim().strip_prefix("off") {
+                            return Some((253, u32::from_str_radix(at, 16).ok()?));
+                        }
+                        if p.trim() == "heap" {
+                            return Some((254, 0));
+                        }
+                        if let Some(dim) = p.trim().strip_prefix("dim") {
+                            return Some((255, dim.parse().ok()?));
+                        }
+                        let (slot, dword) = p.trim().strip_prefix('s')?.split_once('+')?;
+                        Some((slot.parse().ok()?, dword.parse().ok()?))
+                    })
+                    .collect();
+                (hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()) && !places.is_empty())
+                    .then_some((hash, places))
+            })
+            .collect()
+    });
+    if list.is_empty() {
+        return None;
+    }
+    let hash = blake3::hash(container).to_hex();
+    list.iter().find(|(h, _)| h.as_str() == &hash[..16]).map(|(_, p)| p.clone())
+}
+
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+    let bound = clamp_for(container);
+    let zeroed = zeroed_for(container);
+    // `VICTORY_NAN_PROBE=<hash>@<from>-<to>` (byte offsets, hex): see
+    // [`victory_shader::emit::with_nan_probe`].
+    let probe = std::env::var("VICTORY_NAN_PROBE").ok().and_then(|v| {
+        let (hash, range) = v.trim().split_once('@')?;
+        let (from, to) = range.split_once('-')?;
+        let from = usize::from_str_radix(from.trim_start_matches("0x"), 16).ok()?;
+        let to = usize::from_str_radix(to.trim_start_matches("0x"), 16).ok()?;
+        (blake3::hash(container).to_hex()[..16] == *hash.to_ascii_lowercase()).then_some((from, to))
+    });
+    // `VICTORY_EXACT_FLOAT=<hash>[:<bits>],...`: those programs translated with only these
+    // bits of the host's float shortcuts (`victory_shader::emit::rdna`; 0 when not given).
+    let exact = std::env::var("VICTORY_EXACT_FLOAT").ok().and_then(|v| {
+        let own = blake3::hash(container).to_hex();
+        v.split(',').find_map(|item| {
+            let (hash, bits) = item.trim().split_once(':').unwrap_or((item.trim(), "0"));
+            (hash.eq_ignore_ascii_case(&own[..16])).then(|| bits.parse::<u32>().unwrap_or(0))
+        })
+    });
+    // `VICTORY_FTZ=<hash>,...`: those programs flush 32-bit denormals (`fp32-denorm-mode` ftz).
+    let ftz = std::env::var("VICTORY_FTZ").is_ok_and(|v| {
+        let own = blake3::hash(container).to_hex();
+        v.split(',').any(|h| h.trim().eq_ignore_ascii_case(&own[..16]))
+    });
+    // `VICTORY_CLAMP_OPS=<hash>@<from>-<to>@<prefix>[,prefix]@<limit>` (hex offsets).
+    let clamp_ops = std::env::var("VICTORY_CLAMP_OPS").ok().and_then(|v| {
+        let parts: Vec<&str> = v.trim().split('@').collect();
+        let [hash, range, prefixes, limit] = parts[..] else { return None };
+        if !blake3::hash(container).to_hex()[..16].eq_ignore_ascii_case(hash) {
+            return None;
+        }
+        let (from, to) = range.split_once('-')?;
+        Some((
+            usize::from_str_radix(from.trim_start_matches("0x"), 16).ok()?,
+            usize::from_str_radix(to.trim_start_matches("0x"), 16).ok()?,
+            prefixes.split(',').map(str::to_owned).collect::<Vec<_>>(),
+            limit.parse::<f32>().ok()?,
+        ))
+    });
+    // `VICTORY_DPP_OWN=<hash>,...`: those programs' DPP moves give each lane its own value.
+    let dpp_own = std::env::var("VICTORY_DPP_OWN").is_ok_and(|v| {
+        let own = blake3::hash(container).to_hex();
+        v.split(',').any(|h| h.trim().eq_ignore_ascii_case(&own[..16]))
+    });
+    if bound.is_some() || zeroed.is_some() || probe.is_some() || exact.is_some() || ftz || clamp_ops.is_some() || dpp_own {
+        let hash = &blake3::hash(container).to_hex()[..16];
+        let places = zeroed.unwrap_or_default();
+        let (done, met) = victory_shader::emit::with_zeroed_inputs(&places, || {
+            let inner = || match bound {
+                Some(bound) => victory_shader::emit::with_clamped_colour(bound, || victory_shader::emit::translate(container)),
+                None => victory_shader::emit::translate(container),
+            };
+            let probed = || match probe {
+                Some((from, to)) => match std::env::var("VICTORY_NAN_PROBE_ON").ok().filter(|p| !p.is_empty()) {
+                    // (A name prefix such as `v_interp`: only those instructions are probed.)
+                    Some(prefix) => {
+                        let prefix: &'static str = Box::leak(prefix.into_boxed_str());
+                        victory_shader::emit::with_nan_probe_on(prefix, || victory_shader::emit::with_nan_probe(from, to, inner))
+                    }
+                    None if std::env::var_os("VICTORY_NAN_PROBE_NAN").is_some() => {
+                        victory_shader::emit::with_nan_only(|| victory_shader::emit::with_nan_probe(from, to, inner))
+                    }
+                    None => victory_shader::emit::with_nan_probe(from, to, inner),
+                },
+                None => inner(),
+            };
+            let limited = || match std::env::var("VICTORY_NAN_PROBE_LIMIT").ok().and_then(|l| l.parse::<f32>().ok()) {
+                Some(limit) => victory_shader::emit::with_nan_probe_limit(limit, probed),
+                None => probed(),
+            };
+            let signed = || {
+                if std::env::var_os("VICTORY_NAN_PROBE_NEG").is_some() {
+                    victory_shader::emit::with_nan_probe_neg(limited)
+                } else {
+                    limited()
+                }
+            };
+            let clamped = || match clamp_ops.clone() {
+                Some((from, to, prefixes, limit)) => victory_shader::emit::with_clamped_ops(from, to, prefixes, limit, signed),
+                None => signed(),
+            };
+            let owned = || if dpp_own { victory_shader::emit::with_dpp_own(clamped) } else { clamped() };
+            let flushed = || if ftz { victory_shader::emit::with_ftz(owned) } else { owned() };
+            match exact {
+                Some(bits) => victory_shader::emit::with_rdna_bits(bits, flushed),
+                None => flushed(),
+            }
+        });
+        tracing::info!(hash, ?bound, ?places, zeroed_reads = met, ?probe, ?exact, ftz, ?clamp_ops, dpp_own, "translated with a diagnostic change (VICTORY_CLAMP_PIXEL / VICTORY_ZERO_INPUT / VICTORY_NAN_PROBE)");
+        return done.map_err(|e| e.to_string());
+    }
     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
     match CACHE.get() {
         Some(cache) => cached(cache, &build(), container, translate, refresh_in_runs()),

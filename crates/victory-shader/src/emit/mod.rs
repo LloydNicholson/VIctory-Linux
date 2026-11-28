@@ -120,7 +120,8 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use bitcode::with_ftz;
+pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave, with_clamped_colour, with_zeroed_inputs, with_nan_probe, with_nan_probe_on, with_nan_only, with_nan_probe_limit, with_nan_probe_neg, with_clamped_ops, with_dpp_own, with_rdna_bits, Bound as ColourBound};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_CONSTANT_BUFFER, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,

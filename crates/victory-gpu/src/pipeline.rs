@@ -157,6 +157,20 @@ impl Shader {
                     let _translation = crate::timeline::span("pipeline: translate a shader");
                     translate(&self.container)
                 };
+                // `VICTORY_SHADER_NAMES=<hash>,...`: the names in those containers (entry and
+                // pass names: identifiers with an underscore that start with a capital), logged.
+                if std::env::var("VICTORY_SHADER_NAMES").is_ok_and(|v| v.split(',').any(|h| h.trim() == self.hash)) {
+                    let mut names: Vec<String> = Vec::new();
+                    for run in self.container.split(|b| !(b.is_ascii_alphanumeric() || *b == b'_')) {
+                        if run.len() >= 8 && run.contains(&b'_') && run[0].is_ascii_uppercase() {
+                            let name = String::from_utf8_lossy(run).into_owned();
+                            if !names.contains(&name) {
+                                names.push(name);
+                            }
+                        }
+                    }
+                    tracing::info!(stage = self.stage, hash = %self.hash, names = ?names, "shader names");
+                }
                 // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
                 // translated (`.dxil`), by the hash crash reports name it with
                 if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
@@ -517,6 +531,82 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
+/// The ray-tracing passes a compute program belongs to, by the bits of
+/// [`ray_off`]: 1 traverses structures (a BVH intersect instruction in its
+/// code), 2 shades hits (`CS_RaytracingResolve`), 4 activates screen-probe
+/// rays (`CS_ScreenProbes_ActivateRays`), 8 bins rays. As DexNom's
+/// `pipeline/ray_tracing.rs` (`classify`, `traverses`) sorts them.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn ray_class(shader: &Shader) -> u8 {
+    use victory_shader::{Container, FourCC};
+    static SEEN: Mutex<Option<HashMap<String, u8>>> = Mutex::new(None);
+    if shader.stage != "compute" {
+        return 0;
+    }
+    if let Some(&c) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).get(&shader.hash) {
+        return c;
+    }
+    let has = |name: &[u8]| shader.container.windows(name.len()).any(|w| w == name);
+    let mut class = 0;
+    if has(b"CS_RaytracingResolve") {
+        class |= 2;
+    }
+    if has(b"CS_ScreenProbes_ActivateRays") {
+        class |= 4;
+    }
+    for name in [
+        b"CS_ScreenProbes_EvaluateRayRequests_RayBinning_".as_slice(),
+        b"CS_RayBudgeting_Cull_RayBinning_",
+        b"CS_ScreenProbes_GenerateRayBins_",
+        b"CS_GenerateRayBins_",
+        b"CS_GenerateRayBinOffsets_",
+    ] {
+        if has(name) {
+            class |= 8;
+        }
+    }
+    let traverses = Container::parse(&shader.container)
+        .ok()
+        .and_then(|c| c.part(FourCC::DXIL).and_then(|p| victory_shader::native_programs(p.data).ok()))
+        .is_some_and(|programs| {
+            programs.iter().any(|p| {
+                victory_shader::gfx10::decode(&p.code).is_ok_and(|code| {
+                    code.iter().any(|i| matches!(i.name(), Some("image_bvh_intersect_ray" | "image_bvh64_intersect_ray")))
+                })
+            })
+        });
+    if traverses {
+        class |= 1;
+    }
+    if class != 0 {
+        tracing::info!(hash = %shader.hash, class, "a ray-tracing pass (VICTORY_RAY_OFF classes: 1 trace, 2 resolve, 4 activate, 8 bins)");
+    }
+    SEEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(shader.hash.clone(), class);
+    class
+}
+
+/// `VICTORY_RAY_OFF=<trace,resolve,activate,bins | all>` (diagnostics): those
+/// ray-tracing passes are left out while the structure builder does not
+/// run, as DexNom's `--no-rt` leaves them out (their outputs keep what
+/// their memory held).
+#[cfg(all(windows, feature = "diagnostics"))]
+fn ray_off() -> u8 {
+    static OFF: OnceLock<u8> = OnceLock::new();
+    *OFF.get_or_init(|| {
+        let value = std::env::var("VICTORY_RAY_OFF").unwrap_or_default();
+        value.split(',').map(str::trim).fold(0, |bits, name| {
+            bits | match name {
+                "trace" => 1,
+                "resolve" => 2,
+                "activate" => 4,
+                "bins" => 8,
+                "all" => 15,
+                _ => 0,
+            }
+        })
+    })
+}
+
 #[cfg(all(windows, feature = "diagnostics"))]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
@@ -524,6 +614,12 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         let value = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
         parse_skip_hashes(&value)
     });
+    let off = ray_off();
+    if off != 0 && !builder_runs() {
+        if let Some(shader) = p.shaders.iter().find(|s| ray_class(s) & off != 0) {
+            return Some(shader.hash.as_str());
+        }
+    }
     if hashes.is_empty() {
         return None;
     }

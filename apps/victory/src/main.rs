@@ -179,7 +179,31 @@ enum Console {
     SeriesS,
 }
 
+/// `VICTORY_DEBUG_GLASS=<folder>[@x,y,w,h]`: the switches that found the terrarium
+/// glass's garbage, at once (each only where it is not set itself): frame dumps to
+/// `<folder>` (`VICTORY_CAPTURE`; the clip key's file `go` there lists three frames),
+/// their targets with NaN, infinite and huge texels counted (`VICTORY_DUMP_TARGETS=1`)
+/// and the box `x,y,w,h` of half-float targets traced draw by draw
+/// (`VICTORY_TEXEL_TRACE`, the middle of a 2560x1440 picture if not given).
+/// See `docs/debug-switches.md`. Before any thread reads the environment.
+fn debug_glass() {
+    let Some(value) = std::env::var_os("VICTORY_DEBUG_GLASS") else { return };
+    let value = value.to_string_lossy().into_owned();
+    let (folder, area) = value.split_once('@').unwrap_or((&value, "1216,672,128,64"));
+    for (name, set) in [
+        ("VICTORY_CAPTURE", folder),
+        ("VICTORY_DUMP_TARGETS", "1"),
+        ("VICTORY_TEXEL_TRACE", area),
+    ] {
+        if std::env::var_os(name).is_none() {
+            // SAFETY: at the start of `main`, before any other thread runs.
+            unsafe { std::env::set_var(name, set) };
+        }
+    }
+}
+
 fn main() -> Result<()> {
+    debug_glass();
     victory_core::logging::init("info");
     // The audio recorder `run` starts for `VICTORY_AUDIO_CAPTURE`.
     #[cfg(all(windows, feature = "diagnostics"))]
