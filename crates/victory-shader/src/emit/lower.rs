@@ -449,6 +449,13 @@ pub(super) const MASK_ELSEWHERE: Why = "a lane mask holding lanes elsewhere read
 /// Per IR block: every lane of the wave that started the program runs it – no per-lane branch
 /// separates it from the entry (it lies in no lane branch's region: the blocks reachable from
 /// the branch that do not post-dominate it). None with an indirect exit (not followed).
+/// Whether [`Lower::dpp`] keeps DPP moves that fetch from inactive lanes to
+/// running host lanes where not every lane runs (`VICTORY_DPP_INACTIVE=0`: not).
+pub fn dpp_inactive_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DPP_INACTIVE").is_none_or(|v| v != "0"))
+}
+
 fn all_lane_blocks(st: &Structured) -> Option<Vec<bool>> {
     let n = st.exits.len();
     let mut all = vec![true; n];
@@ -8505,6 +8512,21 @@ impl<'a> Lower<'a> {
             return Err("a DPP operand");
         };
         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
+        // A move that fetches from inactive lanes (FI) reads, on the console, what
+        // the lanes the EXEC mask leaves out hold in that register. On the host a
+        // lane that has left through a lane branch holds nothing a read can see:
+        // undefined, and on RADV garbage (the terrarium glass sums its local
+        // lights across the quad at 0x5014, inside the branch of its depth test,
+        // and divides by the summed weight: values at the half-float limit, star
+        // flares in the bloom). Where not every lane runs, such a move takes only
+        // what a running host lane holds and gives the others the lane's own
+        // value (for a quad sum and its weight alike: the mean of the lanes
+        // that ran). `VICTORY_DPP_INACTIVE=0`: as before.
+        let fetch_inactive = matches!(dpp, Dpp::Row { fi: true, .. } | Dpp::Lanes { fi: true, .. });
+        let only_running = fetch_inactive
+            && self.s.pixel
+            && dpp_inactive_on()
+            && !all_lane_blocks(self.x.st).is_some_and(|all| all[self.cur_ir]);
         // Quad permutations and DPP8 stay in groups the pixel layout shares.
         let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
         let mesh_quad = self.s.mesh.is_some() && quad;
@@ -8595,6 +8617,23 @@ impl<'a> Lower<'a> {
         } else {
             self.read_lane(x, src)
         };
+        if only_running {
+            let c = self.cur;
+            let t = self.s.m.bool(true);
+            let i32t = self.s.t.i32;
+            let four = self.s.m.named_struct("dx.types.fouri32", vec![i32t; 4]);
+            let mask = self.s.op(c, "waveActiveBallot", Attr::NoUnwind, four, 116, &[t]);
+            let (k31, k32, one, zero) = (self.s.m.i32(31), self.s.m.i32(32), self.s.m.i32(1), self.s.m.i32(0));
+            let lo = self.s.m.extract(c, mask, 0);
+            let hi = self.s.m.extract(c, mask, 1);
+            let lower = self.s.m.cmp(c, pred::IULT, src, k32);
+            let word = self.s.m.select(c, lower, lo, hi);
+            let bit = self.s.m.bin(c, Bin::And, src, k31);
+            let bit = self.s.m.bin(c, Bin::LShr, word, bit);
+            let bit = self.s.m.bin(c, Bin::And, bit, one);
+            let running = self.s.m.cmp(c, pred::NE, bit, zero);
+            r = self.s.m.select(c, running, r, x);
+        }
         let mut enable = None;
         if let Some(inside) = inside {
             if zero {
